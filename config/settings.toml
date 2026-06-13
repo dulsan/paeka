@@ -1,0 +1,148 @@
+# =============================================================================
+# PAEKA — Application Configuration (native Windows)
+# =============================================================================
+# LLM base_url now points to localhost (llama-server.exe running natively).
+# Weaviate URL points to localhost:8090 (Docker port mapping).
+# =============================================================================
+
+[app]
+name        = "PAEKA"
+version     = "0.11.3"
+description = "Personal AI Engineering & Knowledge Assistant"
+debug       = false
+
+[server]
+host   = "0.0.0.0"
+port   = 8000
+reload = false
+
+[llm]
+provider = "llama_cpp"
+# Native llama-server.exe listens on localhost:8080
+base_url = "http://localhost:8080/v1"
+api_key  = "paeka-local"
+
+model      = "Qwen3.5-9B-Q4_K_M"
+model_path = "qwen/Qwen3.5-9B-Q4_K_M.gguf"
+
+max_tokens      = 4096
+temperature     = 0.7
+top_p           = 0.9
+stream          = true
+request_timeout = 180
+
+system_prompt = """
+You are PAEKA, a Personal AI Engineering and Knowledge Assistant.
+You are precise, technical, and concise. You help with engineering,
+scientific research, software development, and knowledge management.
+When referencing retrieved context, cite the source document by filename and page number.
+"""
+
+[models]
+models_dir = "models"
+auto_scan  = true
+
+[database]
+sqlite_path = "database/sqlite/paeka.db"
+
+[memory]
+enabled              = true
+max_session_messages = 50
+summary_threshold    = 20
+global_memory_limit  = 10
+
+[retrieval]
+enabled      = true
+# Weaviate runs in Docker, mapped to localhost:8090
+weaviate_url = "http://localhost:8090"
+
+embed_model     = "BAAI/bge-m3"
+embed_device    = "cuda"
+reranker_model  = "BAAI/bge-reranker-large"
+reranker_device = "cuda"
+
+top_k        = 20
+rerank_top_n = 5
+hybrid_alpha = 0.75
+max_hops     = 2
+
+chunk_size    = 512
+chunk_overlap = 64
+
+[ingestion]
+default_parser     = "auto"
+max_file_bytes     = 104857600
+versioning_enabled = true
+dedup_threshold    = 0.97
+
+supported_types = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/plain",
+    "text/markdown",
+    "text/html",
+    "text/x-latex",
+]
+
+[knowledge_graph]
+enabled               = true
+db_path               = "database/sqlite/knowledge_graph.db"
+extraction_batch_size = 5
+min_edge_confidence   = 0.6
+refinement_passes     = ["merge_duplicates", "prune_weak_edges", "validate_types"]
+
+entity_types = [
+    "Concept", "Algorithm", "Method", "Framework",
+    "Person", "Organisation", "Dataset", "Paper",
+    "Tool", "Language", "Variable", "Equation",
+]
+
+relation_types = [
+    "IS_A", "PART_OF", "USES", "IMPLEMENTS", "EXTENDS",
+    "DEFINED_IN", "RELATED_TO", "AUTHORED_BY", "CITES",
+    "CONTRASTS_WITH", "DEPENDS_ON", "PRODUCES",
+]
+
+[skills]
+enabled    = true
+skills_dir = "backend/skills/definitions"
+
+[tools]
+web_search_enabled  = true
+# searxng_url kept for future SearXNG re-integration
+searxng_url         = "http://localhost:8888"
+searxng_categories  = "general"
+searxng_language    = "en"
+searxng_max_results = 5
+
+[security]
+content_scan_enabled = true
+strict_mode          = false
+rate_limit_enabled   = false
+chat_rpm             = 20
+upload_rpm           = 10
+default_rpm          = 120
+
+[deploy]
+mode   = "development"
+domain = "localhost"
+
+[logging]
+level  = "INFO"
+format = "rich"
+
+[sandbox]
+enabled         = true
+default_timeout = 30
+max_timeout     = 60
+memory_limit    = "256m"
+cpu_limit       = "1.0"
+
+[iteration]
+default_score_threshold = 0.85
+default_max_iterations  = 4
+
+[tool_calling]
+default_max_retries    = 3
+default_max_iterations = 5

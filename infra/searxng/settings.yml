@@ -1,0 +1,87 @@
+# SearXNG settings for PAEKA
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "PAEKA Search"
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+
+server:
+  port: 8888
+  bind_address: "0.0.0.0"
+  # IMPORTANT: this must NOT be "ultrasecretkey" — SearXNG will refuse to start.
+  # Generate your own with:
+  #   python3 -c "import secrets; print(secrets.token_hex(32))"
+  # Then replace the value below. This is a local-only instance so
+  # the exact value matters less than it not being the default.
+  secret_key: "paeka-searxng-replace-this-with-your-own-secret-key-32chars"
+  limiter: false
+  image_proxy: false
+
+ui:
+  static_use_hash: true
+  default_locale: "en"
+  query_in_title: false
+  default_theme: simple
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    use_mobile_ui: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    categories: science
+
+  - name: semantic scholar
+    engine: semantic_scholar
+    shortcut: ss
+    categories: science
+
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: it
+
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+    categories: it
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    categories: general
+
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gsc
+    disabled: true
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  useragent_suffix: ""
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true

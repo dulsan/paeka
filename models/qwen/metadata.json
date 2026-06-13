@@ -1,0 +1,9 @@
+{
+  "name": "Qwen3.5 9B Q4_K_M",
+  "family": "qwen",
+  "parameters": "9B",
+  "quantisation": "Q4_K_M",
+  "context": 4096,
+  "chat_template": "chatml",
+  "description": "Qwen3.5 9B, 4-bit quantised — CPU-viable at ~5.7 GB. Download from: https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF"
+}

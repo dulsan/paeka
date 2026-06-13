@@ -1,0 +1,117 @@
+# =============================================================================
+# PAEKA — Caddyfile  (v0.11.1-fixed)
+# =============================================================================
+# FIXES over v0.11.1:
+#
+#  [FIX-A] Added explicit /v1/* route to proxy the OpenAI-compatible endpoint.
+#          Without this, requests to /v1/chat/completions from Terax hit the
+#          Caddy default handler and return 404 before reaching paeka-api.
+#
+#  [FIX-B] Added /search/* route to proxy SearXNG.
+#          paeka-searxng is now on the frontend network (see docker-compose fix)
+#          and reachable by Caddy at paeka-searxng:8888.
+#
+# =============================================================================
+
+{
+    admin off
+    auto_https disable_redirects
+    email {$PAEKA_ACME_EMAIL:noreply@localhost}
+}
+
+# ── HTTP → HTTPS redirect ─────────────────────────────────────────────────────
+http://{$PAEKA_DOMAIN} {
+    redir https://{$PAEKA_DOMAIN}{uri} permanent
+}
+
+# ── Main HTTPS virtual host ───────────────────────────────────────────────────
+{$PAEKA_DOMAIN} {
+
+    tls {$PAEKA_TLS_EMAIL:internal} {
+        protocols tls1.2 tls1.3
+        ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 \
+                TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 \
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 \
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 \
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 \
+                TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    }
+
+    header {
+        X-Content-Type-Options       "nosniff"
+        X-Frame-Options              "DENY"
+        X-XSS-Protection             "1; mode=block"
+        Strict-Transport-Security    "max-age=31536000; includeSubDomains"
+        Referrer-Policy              "strict-origin-when-cross-origin"
+        Content-Security-Policy      "default-src 'none'; frame-ancestors 'none'"
+        -Server
+        Cache-Control                "no-store, no-cache, must-revalidate"
+    }
+
+    # ── FIX-A: OpenAI-compatible endpoint (/v1/*) ─────────────────────────
+    # Must be declared BEFORE the catch-all /api/* block so Caddy matches
+    # it first.  Terax connects to /v1/chat/completions and /v1/models.
+    handle /v1/* {
+        reverse_proxy paeka-api:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up Host {host}
+            transport http {
+                keepalive    30s
+                # Extra-long timeout for streaming completions
+                read_timeout  300s
+                write_timeout 300s
+            }
+        }
+    }
+
+    # ── FIX-B: SearXNG web search UI (/search/*) ──────────────────────────
+    handle /search/* {
+        uri strip_prefix /search
+        reverse_proxy paeka-searxng:8888 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up Host {host}
+            transport http {
+                keepalive    15s
+                read_timeout  30s
+                write_timeout 30s
+            }
+        }
+    }
+
+    # ── PAEKA API (/api/*) ───────────────────────────────────────────────
+    handle /api/* {
+        reverse_proxy paeka-api:8000 {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up Host {host}
+
+            health_uri      /api/health
+            health_interval 10s
+            health_timeout  5s
+            health_status   200
+
+            transport http {
+                keepalive    30s
+                read_timeout  180s
+                write_timeout 180s
+            }
+        }
+    }
+
+    # ── Request size limit ────────────────────────────────────────────────
+    request_body {
+        max_size {$PAEKA_MAX_UPLOAD_SIZE:110MB}
+    }
+
+    # ── Access log ────────────────────────────────────────────────────────
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size    50MB
+            roll_keep    5
+            roll_keep_for 720h
+        }
+        format json
+    }
+}

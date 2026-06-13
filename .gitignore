@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment (UV)
+.venv/
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App data
+database/sqlite/*.db
+data/hf_cache/
+data/documents/
+data/images/
+data/uploads/
+data/exports/
+
+# Logs
+*.log
+
+# Test artifacts
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Model weights — never commit GGUF files
+models/**/*.gguf
+models/**/*.gguf.part
+
+# bin contents are too large to git_commit
+bin/*
+!bin/.gitkeep

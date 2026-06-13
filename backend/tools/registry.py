@@ -1,0 +1,105 @@
+"""
+backend/tools/registry.py
+==========================
+Central registry of tools available to the self-healing tool calling agent.
+
+Tools are async callables with a docstring describing their purpose.
+The SelfHealingToolGraph reads tool names and docstrings to build
+the tool schema presented to the LLM.
+
+Registered tools:
+  web_search(query)         — SearXNG search
+  lint_code(code)           — Ruff lint
+  format_code(code)         — Ruff format
+  typecheck_code(code)      — Pyright type check
+  execute_code(code, lang)  — Sandboxed Docker execution
+  retrieve(query)           — Vector + graph retrieval
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Awaitable
+
+logger = logging.getLogger(__name__)
+
+# Type for an async tool function
+ToolFn = Callable[..., Awaitable[str]]
+
+
+def get_registered_tools(request) -> dict[str, ToolFn]:
+    """
+    Build and return the tool registry for the current request.
+
+    Each tool is a closure that captures the required app.state services.
+    Returns only tools whose backing service is available.
+    """
+    tools: dict[str, ToolFn] = {}
+
+    # ── Web search ────────────────────────────────────────────────────
+    web_client = getattr(request.app.state, "web_client", None)
+    if web_client is not None:
+        async def web_search(query: str, num_results: int = 3) -> str:
+            """Search the web via SearXNG. Returns top results as text."""
+            results = await web_client.search(query, num_results=num_results)
+            if not results:
+                return "No results found."
+            return "\n\n".join(
+                f"[{r.title}] ({r.url})\n{r.content[:400]}"
+                for r in results
+            )
+        tools["web_search"] = web_search
+
+    # ── Code linting ──────────────────────────────────────────────────
+    async def lint_code(code: str, filename: str = "snippet.py") -> str:
+        """Run Ruff linting on Python code. Returns issues found or 'No issues'."""
+        from backend.tools.verification import lint_python
+        result = await lint_python(code, filename)
+        return result.output
+
+    tools["lint_code"] = lint_code
+
+    async def format_code(code: str) -> str:
+        """Auto-format Python code with Ruff. Returns the formatted code."""
+        from backend.tools.verification import format_python
+        result = await format_python(code)
+        return result.fixed_code
+
+    tools["format_code"] = format_code
+
+    async def typecheck_code(code: str) -> str:
+        """Run Pyright type checking on Python code. Returns type errors found."""
+        from backend.tools.verification import typecheck_python
+        result = await typecheck_python(code)
+        return result.output
+
+    tools["typecheck_code"] = typecheck_code
+
+    # ── Sandboxed code execution ──────────────────────────────────────
+    async def execute_code(code: str, language: str = "python") -> str:
+        """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
+        from backend.agent.sandbox import get_sandbox
+        sandbox = get_sandbox()
+        if not await sandbox.is_available():
+            return "Docker sandbox unavailable."
+        result = await sandbox.execute(code, language=language, timeout=30)
+        return result.output
+
+    tools["execute_code"] = execute_code
+
+    # ── RAG retrieval ──────────────────────────────────────────────────
+    retrieval = getattr(request.app.state, "retrieval", None)
+    if retrieval is not None:
+        async def retrieve(query: str) -> str:
+            """Search the local knowledge base for relevant passages."""
+            results = retrieval.retrieve(query)
+            if not results:
+                return "No relevant passages found."
+            return "\n\n".join(
+                f"[{r.metadata.get('filename', 'unknown')}] {r.content[:400]}"
+                for r in results[:5]
+            )
+        tools["retrieve"] = retrieve
+
+    logger.debug("Registered tools: %s", list(tools.keys()))
+    return tools

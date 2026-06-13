@@ -1,0 +1,62 @@
+# =============================================================================
+# PAEKA — Docker Compose (native Windows deployment)
+# =============================================================================
+# Only Weaviate runs in Docker here. llama-server and the PAEKA API run
+# natively via start.ps1 (see scripts/start.ps1).
+#
+# Weaviate is exposed on host port 8090 to avoid clashing with llama-server
+# which uses 8080. The PAEKA API connects to http://localhost:8090 as set in .env.
+#
+# Commands:
+#   Start Weaviate: docker compose up -d paeka-weaviate
+#   Stop (data preserved in ./database/weaviate): docker compose down
+#   Fresh start (wipe vector DB): docker compose down -v
+#                                  Remove-Item -Recurse ./database/weaviate
+# =============================================================================
+
+services:
+
+  paeka-weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
+    container_name: paeka-weaviate
+    restart: unless-stopped
+    ports:
+      - "8090:8080"   # host 8090 → container 8080 (llama-server already owns 8080)
+      - "50051:50051"  # gRPC
+    volumes:
+      - ./database/weaviate:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT:                    "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH:                   "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE:               "none"
+      ENABLE_MODULES:                          ""
+      CLUSTER_HOSTNAME:                        "node1"
+      # Increase raft heartbeat timeouts to reduce spurious leader-election
+      # restarts that can make Weaviate appear unresponsive on slow Docker Desktop starts.
+      RAFT_HEARTBEAT_TIMEOUT:                  "5000ms"
+      RAFT_ELECTION_TIMEOUT:                   "10000ms"
+    healthcheck:
+      # Health probe runs inside the container on the internal port (8080)
+      test: ["CMD", "wget", "--no-verbose", "--tries=1",
+             "--spider", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 15s
+      timeout:  10s
+      retries:  10
+      # Increased from 30s: Weaviate can take 60+ s on first raft journal replay
+      start_period: 60s
+
+# =============================================================================
+# Future additions (uncomment when ready):
+#
+#   paeka-searxng:
+#     image: searxng/searxng:latest
+#     container_name: paeka-searxng
+#     restart: unless-stopped
+#     ports:
+#       - "8888:8888"
+#     volumes:
+#       - ./infra/searxng:/etc/searxng:rw
+#     environment:
+#       SEARXNG_BASE_URL: "http://localhost:8888"
+# =============================================================================
