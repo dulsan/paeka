@@ -7,12 +7,17 @@
 # Weaviate is exposed on host port 8090 to avoid clashing with llama-server
 # which uses 8080. The PAEKA API connects to http://localhost:8090 as set in .env.
 #
+# Weaviate uses a Docker named volume (weaviate_data) for persistence.
+# This avoids RAFT cluster state corruption from host-side bind mounts.
+#
 # Commands:
 #   Start Weaviate: docker compose up -d paeka-weaviate
-#   Stop (data preserved in ./database/weaviate): docker compose down
+#   Stop (data preserved): docker compose down
 #   Fresh start (wipe vector DB): docker compose down -v
-#                                  Remove-Item -Recurse ./database/weaviate
 # =============================================================================
+
+volumes:
+  weaviate_data:
 
 services:
 
@@ -24,18 +29,17 @@ services:
       - "8090:8080"   # host 8090 → container 8080 (llama-server already owns 8080)
       - "50051:50051"  # gRPC
     volumes:
-      - ./database/weaviate:/var/lib/weaviate
+      - weaviate_data:/var/lib/weaviate
     environment:
       QUERY_DEFAULTS_LIMIT:                    "25"
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
       PERSISTENCE_DATA_PATH:                   "/var/lib/weaviate"
       DEFAULT_VECTORIZER_MODULE:               "none"
       ENABLE_MODULES:                          ""
-      CLUSTER_HOSTNAME:                        "node1"
       # Increase raft heartbeat timeouts to reduce spurious leader-election
       # restarts that can make Weaviate appear unresponsive on slow Docker Desktop starts.
-      RAFT_HEARTBEAT_TIMEOUT:                  "5000ms"
-      RAFT_ELECTION_TIMEOUT:                   "10000ms"
+      RAFT_HEARTBEAT_TIMEOUT:                  "5000"
+      RAFT_ELECTION_TIMEOUT:                   "10000"
     healthcheck:
       # Health probe runs inside the container on the internal port (8080)
       test: ["CMD", "wget", "--no-verbose", "--tries=1",
