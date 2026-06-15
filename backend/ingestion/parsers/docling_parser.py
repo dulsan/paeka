@@ -1,50 +1,35 @@
 """
 backend/ingestion/parsers/docling_parser.py
 ============================================
-Primary document parser using Docling 2.9.0+.
+Docling-backed document parser.
 
-Changes from v0.11.3:
-  [OPT-1] DocumentConverter now configured explicitly instead of using
-          all defaults. The default configuration enables OCR, table
-          structure recognition via a vision model (TableFormer), and
-          figure classification — all of which require heavy model
-          downloads and significant CPU time per page.
+Fixes applied:
+  [FIX-LOCK]   _get_converter() had a double-checked locking race. Two
+               concurrent ingestion requests both seeing _converter is None
+               would both construct a DocumentConverter, loading models
+               twice. Added threading.Lock around the check-and-assign.
 
-          For born-digital PDFs (i.e. any PDF you can select text in),
-          OCR is completely unnecessary and was the main cause of
-          600-second timeouts on dense academic papers.
+  [FIX-ASYNC]  parse() is a blocking CPU-bound call (5–60s for dense PDFs).
+               Called from async ingest_file() without asyncio.to_thread(),
+               stalling the event loop for the full parse duration.
+               Added async parse_async() wrapper for use in the pipeline.
 
-          New configuration:
-            - do_ocr = False             skip OCR entirely
-            - do_table_structure = True  keep table extraction (fast, rule-based)
-            - generate_picture_images = False  skip figure rendering
-            - images_scale = 1.0         minimal resolution if images needed
+  [FIX-EQ]     Equations were exported via export_to_markdown() which wraps
+               LaTeX in backtick code fences (`$E=mc^2$`). Stored in Weaviate
+               as code strings, rendered as code blocks in the UI. Now uses
+               item.text directly (raw LaTeX) when available.
 
-  [OPT-2] Added PAEKA_INGESTION__FAST_MODE env var toggle.
-          Set PAEKA_INGESTION__FAST_MODE=true in .env for maximum speed:
-            - disables table structure recognition too
-            - plain text + headings only
-            - ~5-15s per paper instead of 60-300s
-          Default is False (full mode: text + tables + equations).
-
-  [OPT-3] Converter is cached as a module-level singleton so the
-          pipeline and its models are loaded only once per process,
-          not once per document. Previously a new DocumentConverter()
-          was instantiated on every call to parse(), paying the model
-          load cost on every single file.
-
-Expected parse times after these changes (CPU, 9B model host machine):
-  Born-digital PDF, 10-20 pages:   5-20s   (was 60-180s)
-  Born-digital PDF, 50-100 pages:  20-60s  (was 300-600s)
-  Scanned PDF (needs OCR):         use PAEKA_INGESTION__FAST_MODE=false
-                                   and accept the longer parse time,
-                                   or pre-OCR with a dedicated tool
+  [FIX-SCAN]   No detection of scanned PDFs. After parsing, if zero text
+               elements are found, the document is flagged as "likely scanned"
+               and re-parsed with OCR enabled, with a clear log warning.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
 from pathlib import Path
 
 from backend.ingestion.parsers.base import (
@@ -56,84 +41,151 @@ from backend.ingestion.parsers.base import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Converter singleton — loaded once, reused for every document
+# Converter singleton — thread-safe
 # ---------------------------------------------------------------------------
 
-_converter = None
+_converter      = None
+_converter_lock = threading.Lock()   # [FIX-LOCK]
 
 
-def _get_converter():
+def _get_converter(force_ocr: bool = False):
+    """
+    Return the cached DocumentConverter singleton.
+    Thread-safe: uses a lock to prevent concurrent construction races.
+    """
     global _converter
-    if _converter is not None:
+
+    # Fast path — already built (read without lock is safe because the
+    # variable is only ever written under the lock once).
+    if _converter is not None and not force_ocr:
         return _converter
 
-    try:
-        from docling.document_converter import DocumentConverter
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.datamodel.base_models import InputFormat
-        from docling.document_converter import PdfFormatOption
-    except ImportError as exc:
-        raise ImportError(
-            "docling is not installed. Run: uv add 'docling>=2.9.0'"
-        ) from exc
+    with _converter_lock:
+        # Re-check inside the lock (classic double-checked locking, now safe).
+        if _converter is not None and not force_ocr:
+            return _converter
 
-    fast_mode = os.environ.get("PAEKA_INGESTION__FAST_MODE", "false").lower() == "true"
+        try:
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
+        except ImportError as exc:
+            raise ImportError(
+                "docling is not installed. Run: uv add 'docling>=2.9.0'"
+            ) from exc
 
-    pipeline_options = PdfPipelineOptions()
+        fast_mode = os.environ.get("PAEKA_INGESTION__FAST_MODE", "false").lower() == "true"
+        pipeline_options = PdfPipelineOptions()
 
-    # OPT-1: Disable OCR — born-digital PDFs don't need it and it's the
-    # single biggest time cost (loads TesseractOCR + EasyOCR models)
-    pipeline_options.do_ocr = False
+        if force_ocr:
+            pipeline_options.do_ocr            = True
+            pipeline_options.do_table_structure = True
+            logger.info("Docling converter: OCR mode (scanned document detected)")
+        else:
+            pipeline_options.do_ocr = False
+            if fast_mode:
+                pipeline_options.do_table_structure = False
+                logger.info("Docling converter: fast mode (OCR=off, tables=off)")
+            else:
+                pipeline_options.do_table_structure = True
+                logger.info("Docling converter: full mode (OCR=off, tables=on)")
 
-    if fast_mode:
-        # OPT-2: Fast mode — plain text + headings only, no table vision model
-        pipeline_options.do_table_structure = False
-        logger.info("Docling converter: fast mode (OCR=off, tables=off)")
-    else:
-        # Full mode — table structure on (rule-based, much faster than OCR)
-        pipeline_options.do_table_structure = True
-        logger.info("Docling converter: full mode (OCR=off, tables=on)")
+        pipeline_options.generate_picture_images = False
+        pipeline_options.images_scale            = 1.0
 
-    # Skip rendering figure images — we only keep captions
-    pipeline_options.generate_picture_images = False
-    pipeline_options.images_scale = 1.0
-
-    _converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-        }
-    )
-    logger.info("Docling converter initialised (singleton)")
-    return _converter
+        conv = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
+        if not force_ocr:
+            _converter = conv
+        return conv
 
 
 # ---------------------------------------------------------------------------
-# Public parse function
+# Async wrapper for pipeline use  [FIX-ASYNC]
 # ---------------------------------------------------------------------------
 
-def parse(path: Path) -> ParsedDocument:
+async def parse_async(path: Path, force_ocr: bool = False) -> ParsedDocument:
     """
-    Parse any supported file with Docling's DocumentConverter.
+    Async wrapper around parse(). Use this from async ingestion pipeline
+    code instead of calling parse() directly.
 
-    Supported: PDF, DOCX, PPTX, HTML, MD, images (PNG/JPEG), LaTeX
-
-    Returns
-    -------
-    ParsedDocument
-        Elements map 1-to-1 with Docling's document items.
-        The raw DoclingDocument is stored in metadata["docling_doc"]
-        so the HybridChunker can operate on it directly.
+    Runs the blocking Docling conversion in a thread pool worker so it
+    does not stall the FastAPI event loop for the 5–60s parse duration.
     """
-    converter = _get_converter()
+    return await asyncio.to_thread(parse, path, force_ocr)
 
-    logger.info("Docling parsing: %s", path.name)
 
+# ---------------------------------------------------------------------------
+# Synchronous parse (called via asyncio.to_thread from parse_async)
+# ---------------------------------------------------------------------------
+
+def parse(path: Path, force_ocr: bool = False) -> ParsedDocument:
+    """
+    Parse any Docling-supported file (PDF, DOCX, PPTX, HTML, MD, images).
+
+    The raw DoclingDocument is stored in metadata["docling_doc"] so the
+    HybridChunker can operate on it directly without re-parsing.
+    """
+    converter = _get_converter(force_ocr=force_ocr)
+
+    logger.info("Docling parsing: %s (ocr=%s)", path.name, force_ocr)
     result = converter.convert(str(path))
 
     if result is None or result.document is None:
         raise RuntimeError(f"Docling returned no document for {path.name}")
 
-    doc = result.document
+    doc      = result.document
+    elements = _extract_elements(doc)
+
+    # [FIX-SCAN] Detect scanned PDFs: if no text elements were found and
+    # this is a PDF, retry with OCR enabled and a visible warning.
+    text_count = sum(
+        1 for e in elements
+        if e.element_type in (ElementType.TEXT, ElementType.LIST_ITEM,
+                               ElementType.HEADING, ElementType.CODE)
+        and len(e.content.strip()) > 10
+    )
+    suffix = path.suffix.lower()
+    if text_count == 0 and suffix == ".pdf" and not force_ocr:
+        logger.warning(
+            "Docling: zero text elements found in '%s'. "
+            "This is likely a scanned PDF. Re-parsing with OCR enabled. "
+            "Expect significantly longer parse time (30-300s).",
+            path.name,
+        )
+        ocr_converter = _get_converter(force_ocr=True)
+        ocr_result    = ocr_converter.convert(str(path))
+        if ocr_result and ocr_result.document:
+            doc      = ocr_result.document
+            elements = _extract_elements(doc)
+
+    meta: dict = {"docling_doc": doc}
+    if hasattr(doc, "name") and doc.name:
+        meta["title"] = doc.name
+
+    logger.info(
+        "Docling parsed %s → %d elements (%dH %dT %dEQ)",
+        path.name, len(elements),
+        sum(1 for e in elements if e.element_type == ElementType.HEADING),
+        sum(1 for e in elements if e.element_type == ElementType.TABLE),
+        sum(1 for e in elements if e.element_type == ElementType.EQUATION),
+    )
+
+    import mimetypes
+    mime_type, _ = mimetypes.guess_type(str(path))
+    return ParsedDocument(
+        filename=path.name,
+        mime_type=mime_type or "application/octet-stream",
+        elements=elements,
+        parser_used="docling",
+        metadata=meta,
+    )
+
+
+def _extract_elements(doc) -> list[DocumentElement]:
     elements: list[DocumentElement] = []
     current_heading = ""
 
@@ -142,13 +194,12 @@ def parse(path: Path) -> ParsedDocument:
 
         if "sectionheader" in item_type or "title" in item_type:
             text = _text(item)
-            heading_level = getattr(item, "level", 1)
             current_heading = text
             elements.append(DocumentElement(
                 element_type=ElementType.HEADING,
                 content=text,
                 page=_page(item),
-                level=heading_level,
+                level=getattr(item, "level", 1),
                 heading=text,
             ))
 
@@ -173,13 +224,16 @@ def parse(path: Path) -> ParsedDocument:
             ))
 
         elif "equation" in item_type or "formula" in item_type:
-            text = _text(item)
+            # [FIX-EQ] Prefer raw text (LaTeX) over export_to_markdown()
+            # which wraps equations in backtick code fences.
+            text = _equation_text(item)
             if text:
                 elements.append(DocumentElement(
                     element_type=ElementType.EQUATION,
                     content=text,
                     page=_page(item),
                     heading=current_heading,
+                    metadata={"is_latex": True},
                 ))
 
         elif "code" in item_type or "listing" in item_type:
@@ -217,67 +271,42 @@ def parse(path: Path) -> ParsedDocument:
                     heading=current_heading,
                 ))
 
-    meta: dict = {"docling_doc": doc}
-    if hasattr(doc, "name") and doc.name:
-        meta["title"] = doc.name
+    return elements
 
-    logger.info(
-        "Docling parsed %s → %d elements (%d headings, %d tables, %d equations)",
-        path.name, len(elements),
-        sum(1 for e in elements if e.element_type == ElementType.HEADING),
-        sum(1 for e in elements if e.element_type == ElementType.TABLE),
-        sum(1 for e in elements if e.element_type == ElementType.EQUATION),
-    )
 
-    import mimetypes
-    mime_type, _ = mimetypes.guess_type(str(path))
-    return ParsedDocument(
-        filename=path.name,
-        mime_type=mime_type or "application/octet-stream",
-        elements=elements,
-        parser_used="docling",
-        metadata=meta,
-    )
-
+# ---------------------------------------------------------------------------
+# HybridChunker interface (unchanged)
+# ---------------------------------------------------------------------------
 
 def chunk_with_hybrid_chunker(
     parsed: ParsedDocument,
     embed_model_name: str = "BAAI/bge-m3",
     max_tokens: int | None = None,
 ) -> list:
-    """
-    Use Docling's HybridChunker to produce tokenisation-aware chunks
-    directly from a DoclingDocument.
-    """
     try:
         from docling.chunking import HybridChunker
     except ImportError:
         try:
             from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
         except ImportError as exc:
-            raise ImportError(
-                "docling-core is not installed. Run: uv add 'docling>=2.9.0'"
-            ) from exc
+            raise ImportError("docling-core not installed") from exc
 
     doc = parsed.metadata.get("docling_doc")
     if doc is None:
         raise ValueError(
-            "No DoclingDocument found in metadata. "
-            "Was this ParsedDocument created by docling_parser.parse()?"
+            "No DoclingDocument in metadata. Was this ParsedDocument created by docling_parser.parse()?"
         )
-
     kwargs: dict = {}
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-
     chunker = HybridChunker(tokenizer=embed_model_name, **kwargs)
-    chunks = list(chunker.chunk(doc))
-    logger.debug("HybridChunker produced %d chunks from %s", len(chunks), parsed.filename)
+    chunks  = list(chunker.chunk(doc))
+    logger.debug("HybridChunker: %d chunks from %s", len(chunks), parsed.filename)
     return chunks
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Text extraction helpers
 # ---------------------------------------------------------------------------
 
 def _text(item: object) -> str:
@@ -288,7 +317,30 @@ def _text(item: object) -> str:
     if callable(getattr(item, "export_to_markdown", None)):
         try:
             return item.export_to_markdown().strip()  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001
+        except Exception:
+            pass
+    return ""
+
+
+def _equation_text(item: object) -> str:
+    """
+    Extract equation text preferring raw LaTeX over markdown export.
+    [FIX-EQ] export_to_markdown() wraps math in backticks → code strings.
+    We want the raw LaTeX string for proper math rendering (MathJax/KaTeX).
+    """
+    # Try direct .text attribute first (raw LaTeX in most Docling versions)
+    for attr in ("text", "content", "value", "latex"):
+        val = getattr(item, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    # Fall back to export_to_markdown as last resort (will have code fences)
+    if callable(getattr(item, "export_to_markdown", None)):
+        try:
+            md = item.export_to_markdown().strip()  # type: ignore[union-attr]
+            # Strip backtick fences that docling adds around math
+            md = md.strip("`").strip()
+            return md
+        except Exception:
             pass
     return ""
 
@@ -316,6 +368,6 @@ def _table_md(item: object) -> str:
             md = item.export_to_markdown()  # type: ignore[union-attr]
             if md and md.strip():
                 return md.strip()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return _text(item)

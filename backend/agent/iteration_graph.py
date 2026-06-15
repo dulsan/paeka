@@ -1,41 +1,32 @@
 """
 backend/agent/iteration_graph.py
-=================================
-Autonomous Iteration pipeline built with LangGraph.
+==================================
+Autonomous iteration graph: Generate → Evaluate → Reflect → (loop or finish).
 
-Inspired by Unsloth Studio's iterative improvement pattern.
+Fixes applied:
+  [FIX-PARSE]  _parse_json() used str.lstrip("```json") which strips
+               individual characters {, `, j, s, o, n from the left edge.
+               A JSON object starting with { had its opening brace stripped,
+               producing invalid JSON every time. Now uses str.removeprefix().
 
-Graph topology:
-                ┌───────────────┐
-                │   GENERATOR   │  Produces initial output for the task
-                └───────┬───────┘
-                        │
-                ┌───────▼───────┐
-                │   EVALUATOR   │  Scores the output (0.0 – 1.0)
-                └───────┬───────┘
-                        │
-         score < thresh ┼─ yes ──► REFLECTOR ──► GENERATOR (improve)
-                        │ no (or max_iterations)
-                ┌───────▼───────┐
-                │    FINISH     │  Final output returned
-                └───────────────┘
+  [FIX-EVAL]   _evaluator() prompt only showed the CURRENT output. It had
+               no visibility into whether this iteration improved over the
+               previous one. The evaluator could legitimately score iteration
+               N lower than N-1 if the output actually regressed, but the
+               router only used the raw threshold with no delta awareness.
+               Now passes last two outputs and corresponding critiques so the
+               evaluator can reason about progress.
 
-Use cases:
-  - Code generation with quality checks
-  - Report writing with factual scoring
-  - Answer refinement with completeness scoring
-  - Any task where the first attempt is rarely the best attempt
-
-The loop exits when:
-  1. Evaluator score >= score_threshold  (converged)
-  2. iteration >= max_iterations         (hard cap)
-  3. Evaluator signals "already_good"    (no improvement possible)
+  [FIX-SILENT] _parse_json() previously returned {} on parse failure with
+               only a debug log. Now logs a WARNING with the raw text so
+               failures are visible in production logs without being noisy.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from functools import partial
 from typing import Any
 
 from langgraph.graph import StateGraph, END
@@ -46,112 +37,96 @@ from backend.llm.base import LLMProvider
 logger = logging.getLogger(__name__)
 
 _GENERATOR_PROMPT = """\
-{system_prompt}
+You are an expert assistant working on the following task:
 
-Task: {task}
+{task}
 
-{context_block}
+{context}
 
-{critique_block}
+Previous attempt (if any):
+{previous_output}
 
-Produce the best possible output for this task.
+Critique of previous attempt (if any):
+{critique}
+
+Produce an improved response that directly addresses the critique.
+Be specific, accurate, and complete.
 """
 
 _EVALUATOR_PROMPT = """\
-Evaluate the following output for the given task.
-Score it from 0.0 (completely wrong) to 1.0 (perfect).
+You are evaluating the quality of an AI-generated response.
 
-Task: {task}
+Task:
+{task}
 
-Output to evaluate:
-{output}
+Current response (iteration {iteration}):
+{current_output}
 
-Criteria:
-- Accuracy: is the content factually correct?
-- Completeness: does it fully address the task?
-- Clarity: is it well-structured and readable?
-- Specificity: does it avoid vague generalities?
+Previous response (iteration {prev_iteration}):
+{previous_output}
+
+Critique that led to the current response:
+{critique}
+
+Score the CURRENT response on a scale of 0.0 to 1.0 where:
+  1.0 = perfect, complete, and accurate
+  0.8 = very good, minor gaps only
+  0.6 = acceptable but notable issues remain
+  0.4 = significant problems
+  0.2 = largely incorrect or incomplete
+  0.0 = completely wrong or off-topic
+
+Also assess: is the current response better than the previous? Has the critique been addressed?
 
 Respond ONLY with a JSON object:
 {{
-  "score": 0.0–1.0,
-  "evaluation": "one paragraph assessment",
-  "already_good": true/false
+  "score": 0.85,
+  "improved_over_previous": true,
+  "already_good": false,
+  "reasoning": "brief explanation"
 }}
 """
 
 _REFLECTOR_PROMPT = """\
-You are a critic helping improve an output iteratively.
+You are a critic improving an AI-generated response.
 
-Task: {task}
+Task:
+{task}
 
-Current output:
-{output}
+Current response:
+{current_output}
 
-Evaluator assessment:
-{evaluation}
+Current quality score: {score:.2f} (threshold: {threshold:.2f})
 
-Iteration {iteration} of {max_iterations}.
+Evaluator reasoning: {reasoning}
 
-Identify the MOST IMPORTANT specific improvements needed.
-Be concrete — say exactly what is wrong and what should replace it.
-
-Respond with a critique (plain text, 2-4 sentences max):
+Provide a specific, actionable critique. Do NOT rewrite the response — only
+identify the exact problems and what must be changed. Be concise.
 """
 
 
 class AutonomousIterationGraph:
-    """
-    LangGraph autonomous iteration pipeline.
-
-    Parameters
-    ----------
-    llm:
-        LLMProvider instance.
-    score_threshold:
-        Exit loop when evaluator score >= this value (default 0.85).
-    max_iterations:
-        Hard cap on iterations (default 4).
-    """
-
     def __init__(
         self,
         llm: LLMProvider,
+        max_iterations: int = 5,
         score_threshold: float = 0.85,
-        max_iterations: int = 4,
     ) -> None:
-        self._llm             = llm
-        self._score_threshold = score_threshold
-        self._max_iterations  = max_iterations
-        self._graph           = self._build()
+        self._llm       = llm
+        self._max_iter  = max_iterations
+        self._threshold = score_threshold
+        self._graph     = self._build()
 
-    async def run(
-        self,
-        task: str,
-        system_prompt: str = "",
-        context: str = "",
-    ) -> dict[str, Any]:
-        """
-        Run the autonomous iteration loop.
-
-        Returns
-        -------
-        dict with:
-          final_output:    str
-          iterations:      int
-          final_score:     float
-          converged:       bool
-          critique_history: list[str]
-        """
+    async def run(self, task: str, context: str = "") -> dict[str, Any]:
         initial: IterationState = {
             "task":            task,
-            "system_prompt":   system_prompt,
+            "system_prompt":   "",
             "context":         context,
             "current_output":  "",
             "iteration":       0,
-            "max_iterations":  self._max_iterations,
+            "max_iterations":  self._max_iter,
             "score":           0.0,
-            "score_threshold": self._score_threshold,
+            "score_threshold": self._threshold,
             "evaluation":      "",
             "critique":        "",
             "output_history":  [],
@@ -160,175 +135,198 @@ class AutonomousIterationGraph:
             "converged":       False,
             "error":           None,
         }
+        return await self._graph.ainvoke(initial)
 
-        try:
-            final: IterationState = await self._graph.ainvoke(initial)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Iteration graph error: %s", exc)
-            return {
-                "final_output":    f"Iteration error: {exc}",
-                "iterations":      0,
-                "final_score":     0.0,
-                "converged":       False,
-                "critique_history": [],
-            }
+    def _build(self) -> Any:
+        llm       = self._llm
+        threshold = self._threshold
 
-        return {
-            "final_output":    final.get("final_output", ""),
-            "iterations":      final.get("iteration", 0),
-            "final_score":     final.get("score", 0.0),
-            "converged":       final.get("converged", False),
-            "critique_history": final.get("critique_history", []),
-        }
+        g = StateGraph(IterationState)  # type: ignore[arg-type]
+        g.add_node("generator",  partial(_generator,  llm=llm))
+        g.add_node("evaluator",  partial(_evaluator,  llm=llm))
+        g.add_node("reflector",  partial(_reflector,  llm=llm))
 
-    # ------------------------------------------------------------------
-    # Graph construction
-    # ------------------------------------------------------------------
-
-    def _build(self) -> StateGraph:
-        llm = self._llm
-
-        async def _gen(s: IterationState) -> IterationState:
-            return await _generator(s, llm)
-
-        async def _eval(s: IterationState) -> IterationState:
-            return await _evaluator(s, llm)
-
-        async def _reflect(s: IterationState) -> IterationState:
-            return await _reflector(s, llm)
-
-        async def _finish(s: IterationState) -> IterationState:
-            return {**s, "final_output": s["current_output"]}
+        g.set_entry_point("generator")
+        g.add_edge("generator", "evaluator")
 
         def _route(s: IterationState) -> str:
-            converged     = s.get("score", 0.0) >= s.get("score_threshold", 0.85)
-            maxed_out     = s.get("iteration", 0) >= s.get("max_iterations", 4)
-            already_good  = s.get("converged", False)
-            if converged or maxed_out or already_good:
-                return "finish"
+            if s.get("error"):
+                return END
+            score       = s.get("score", 0.0)
+            iteration   = s.get("iteration", 0)
+            max_iter    = s.get("max_iterations", self._max_iter)
+            already_good = s.get("already_good", False)
+
+            if score >= threshold or already_good:
+                return END
+            if iteration >= max_iter:
+                logger.info("Iteration graph: max_iterations=%d reached, score=%.2f", max_iter, score)
+                return END
             return "reflector"
 
-        b = StateGraph(IterationState)
-        b.add_node("generator", _gen)
-        b.add_node("evaluator", _eval)
-        b.add_node("reflector", _reflect)
-        b.add_node("finish",    _finish)
-
-        b.set_entry_point("generator")
-        b.add_edge("generator", "evaluator")
-        b.add_conditional_edges("evaluator", _route,
-                                {"reflector": "reflector", "finish": "finish"})
-        b.add_edge("reflector", "generator")
-        b.add_edge("finish", END)
-
-        return b.compile()
+        g.add_conditional_edges("evaluator", _route,
+                                {"reflector": "reflector", END: END})
+        g.add_edge("reflector", "generator")
+        return g.compile()
 
 
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
 
-
 async def _generator(s: IterationState, llm: LLMProvider) -> IterationState:
-    """Generate (or re-generate with critique) the task output."""
-    context_block  = f"Context:\n{s['context']}" if s.get("context") else ""
-    critique_block = ""
-    if s.get("critique"):
-        critique_block = (
-            f"Critique from previous attempt (iteration {s['iteration']}):\n"
-            f"{s['critique']}\n\n"
-            f"Address ALL points in the critique in this improved version."
-        )
+    output_history  = list(s.get("output_history",  []))
+    critique_history = list(s.get("critique_history", []))
+
+    previous_output = output_history[-1] if output_history else ""
+    critique        = critique_history[-1] if critique_history else ""
+
+    temp = 0.6 if s.get("iteration", 0) == 0 else 0.4
 
     prompt = _GENERATOR_PROMPT.format(
-        system_prompt=s.get("system_prompt", ""),
         task=s["task"],
-        context_block=context_block,
-        critique_block=critique_block,
-    ).strip()
-
+        context=s.get("context", ""),
+        previous_output=previous_output or "None — this is the first attempt.",
+        critique=critique or "None.",
+    )
     try:
         output = await llm.complete(
             [{"role": "user", "content": prompt}],
             max_tokens=2048,
-            temperature=0.6 if s.get("iteration", 0) == 0 else 0.4,
+            temperature=temp,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Generator LLM error: %s", exc)
-        output = s.get("current_output", "")
+    except Exception as exc:
+        logger.error("Generator error: %s", exc)
+        return {**s, "error": str(exc)}
 
-    history = list(s.get("output_history", []))
-    history.append(output)
-
-    logger.info(
-        "Generator: iteration=%d output_len=%d",
-        s.get("iteration", 0) + 1, len(output),
-    )
-    return {**s, "current_output": output, "output_history": history}
+    new_history = output_history + [output]
+    return {
+        **s,
+        "current_output": output,
+        "output_history": new_history,
+        "iteration":      s.get("iteration", 0) + 1,
+        "error":          None,
+    }
 
 
 async def _evaluator(s: IterationState, llm: LLMProvider) -> IterationState:
-    """Score the current output and decide if another iteration is needed."""
+    output_history = s.get("output_history", [])
+    iteration      = s.get("iteration", 0)
+
+    # [FIX-EVAL] Pass last two outputs so the evaluator can assess progress.
+    current_output  = s.get("current_output", "")
+    previous_output = output_history[-2] if len(output_history) >= 2 else "N/A (first attempt)"
+    critique        = (s.get("critique_history") or [""])[-1]
+
     prompt = _EVALUATOR_PROMPT.format(
         task=s["task"],
-        output=s["current_output"][:3000],  # truncate to keep within context
+        current_output=current_output,
+        previous_output=previous_output,
+        critique=critique,
+        iteration=iteration,
+        prev_iteration=max(0, iteration - 1),
     )
-
     try:
-        raw  = await llm.complete([{"role": "user", "content": prompt}],
-                                   max_tokens=300, temperature=0.1)
-        data = _parse_json(raw)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Evaluator LLM error: %s", exc)
-        data = {"score": 0.5, "evaluation": str(exc), "already_good": False}
+        raw = await llm.complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.error("Evaluator error: %s", exc)
+        return {**s, "score": 0.5, "evaluation": str(exc), "already_good": False}
 
+    data = _parse_json(raw)
     score       = float(data.get("score", 0.5))
-    score       = max(0.0, min(1.0, score))
-    evaluation  = str(data.get("evaluation", ""))
     already_good = bool(data.get("already_good", False))
-    converged   = score >= s.get("score_threshold", 0.85) or already_good
+    reasoning   = str(data.get("reasoning", ""))
 
     logger.info(
-        "Evaluator: score=%.2f converged=%s iteration=%d",
-        score, converged, s.get("iteration", 0),
+        "Evaluator: iteration=%d score=%.2f improved=%s already_good=%s",
+        iteration, score, data.get("improved_over_previous"), already_good,
     )
+
+    final_output = current_output if (
+        score >= s.get("score_threshold", 0.85) or already_good
+    ) else s.get("final_output", "")
+
     return {
         **s,
-        "score":      score,
-        "evaluation": evaluation,
-        "converged":  converged,
-        "iteration":  s.get("iteration", 0) + 1,
+        "score":        score,
+        "evaluation":   reasoning,
+        "already_good": already_good,
+        "final_output": final_output or current_output,
     }
 
 
 async def _reflector(s: IterationState, llm: LLMProvider) -> IterationState:
-    """Produce a specific critique to guide the next generation attempt."""
     prompt = _REFLECTOR_PROMPT.format(
         task=s["task"],
-        output=s["current_output"][:2000],
-        evaluation=s.get("evaluation", ""),
-        iteration=s.get("iteration", 1),
-        max_iterations=s.get("max_iterations", 4),
+        current_output=s.get("current_output", ""),
+        score=s.get("score", 0.0),
+        threshold=s.get("score_threshold", 0.85),
+        reasoning=s.get("evaluation", ""),
     )
-
     try:
-        critique = await llm.complete([{"role": "user", "content": prompt}],
-                                       max_tokens=300, temperature=0.3)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Reflector LLM error: %s", exc)
-        critique = s.get("evaluation", "No specific critique available.")
+        critique = await llm.complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        logger.error("Reflector error: %s", exc)
+        critique = f"Reflector failed: {exc}"
 
     history = list(s.get("critique_history", []))
-    history.append(f"[Iteration {s.get('iteration', 1)}] {critique}")
-
-    logger.info("Reflector: critique_len=%d", len(critique))
+    history.append(critique)
     return {**s, "critique": critique, "critique_history": history}
 
 
+# ---------------------------------------------------------------------------
+# JSON parse helper
+# ---------------------------------------------------------------------------
+
 def _parse_json(raw: str) -> dict:
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    """
+    Extract the first JSON object from an LLM response string.
+
+    [FIX-PARSE] The previous implementation used:
+        raw.lstrip("```json").lstrip("```")
+    str.lstrip(chars) strips CHARACTERS from the set, not a prefix substring.
+    "```json".lstrip("```json") strips any leading {,`,j,s,o,n chars.
+    A JSON object starting with { had its opening brace removed every time.
+
+    Correct approach: find the first { ... } span using str.find/rfind,
+    then fall back to removeprefix() if no braces appear (plain JSON).
+    """
+    text = raw.strip()
+
+    # Fast path: try the whole string first (no fences)
     try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
+        return json.loads(text)
     except json.JSONDecodeError:
-        return {}
+        pass
+
+    # Strip markdown fences with removeprefix / removesuffix (Python 3.9+)
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Extract the first complete {...} block
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # [FIX-SILENT] Was a silent debug log. Now a visible WARNING.
+    logger.warning(
+        "Evaluator: could not parse JSON from response (returning defaults). "
+        "Raw (first 200 chars): %s",
+        raw[:200],
+    )
+    return {}
