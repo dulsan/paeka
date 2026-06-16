@@ -1,0 +1,42 @@
+# models/qwen/Modelfile
+# =============================================================================
+# Imports your existing Qwen3.5-9B-Q4_K_M.gguf into Ollama.
+#
+# Run from the project root:
+#   ollama create paeka-qwen -f models\qwen\Modelfile
+#
+# This creates a model named "paeka-qwen" in Ollama's local registry.
+# It does NOT copy the GGUF file - it links to it in place.
+#
+# After creation, verify with: ollama list
+# Test with: ollama run paeka-qwen "Hello"
+#
+# Thinking mode:
+#   Disabled (default): the model responds directly without "think" blocks
+#   Enabled per-request: add /think to the user message
+#   Qwen3.5-9B is not optimised for thinking mode at 9B scale - keep it off
+# =============================================================================
+
+FROM ./Qwen3.5-9B-Q4_K_M.gguf
+
+# Context window (must match --ctx-size used previously with llama-server)
+PARAMETER num_ctx 8192
+
+# GPU layers - 99 offloads all layers to the ADA 2000's VRAM
+PARAMETER num_gpu 99
+
+# Generation parameters matching Unsloth's recommendation for non-thinking 9B
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER presence_penalty 1.5
+
+# Disable thinking mode by default (non-thinking is better for 9B)
+# /no_think can also be passed in individual prompts to override per-call
+# PARAMETER think false -- this parameter is no longer used by Ollama as model thinking/reasoning is handled
+# internally via system prompts or templates.
+
+SYSTEM """You are PAEKA, a Personal AI Engineering and Knowledge Assistant.
+You are precise, technical, and concise. You help with engineering,
+scientific research, software development, and knowledge management.
+When referencing retrieved context, cite the source document by filename and page number."""

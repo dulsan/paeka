@@ -1,0 +1,25 @@
+# Qdrant vector database configuration
+# Used by: bin\qdrant.exe --config-path config\qdrant.yaml
+#
+# Download qdrant.exe from:
+#   https://github.com/qdrant/qdrant/releases
+#   File: qdrant-x86_64-pc-windows-msvc.zip
+#   Extract qdrant.exe to: bin\qdrant.exe
+
+storage:
+  # Data persists here across restarts
+  # Use a local path outside OneDrive to avoid file lock issues
+  storage_path: ./database/qdrant
+
+service:
+  host: 0.0.0.0
+  http_port: 6333
+  grpc_port: 6334
+  # Max upload size (bytes) - 100 MB for large document batches
+  max_request_size_mb: 256
+
+# Disable anonymous telemetry
+telemetry:
+  disabled: true
+
+log_level: INFO

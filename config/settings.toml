@@ -1,8 +1,5 @@
 # =============================================================================
-# PAEKA — Application Configuration (native Windows)
-# =============================================================================
-# LLM base_url now points to localhost (llama-server.exe running natively).
-# Weaviate URL points to localhost:8090 (Docker port mapping).
+# PAEKA - Application Configuration
 # =============================================================================
 
 [app]
@@ -17,17 +14,20 @@ port   = 8000
 reload = false
 
 [llm]
-provider = "llama_cpp"
-# Native llama-server.exe listens on localhost:8080
-base_url = "http://localhost:8080/v1"
-api_key  = "paeka-local"
+# Ollama serves an OpenAI-compatible API at localhost:11434
+# Import your existing GGUF with:
+#   ollama create paeka-qwen -f models\qwen\Modelfile
+# Or pull from hub: ollama pull qwen3:9b
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+api_key  = "ollama"
 
-model      = "Qwen3.5-9B-Q4_K_M"
-model_path = "qwen/Qwen3.5-9B-Q4_K_M.gguf"
+model      = "paeka-qwen"
+model_path = ""
 
 max_tokens      = 4096
 temperature     = 0.7
-top_p           = 0.9
+top_p           = 0.8
 stream          = true
 request_timeout = 180
 
@@ -52,22 +52,25 @@ summary_threshold    = 20
 global_memory_limit  = 10
 
 [retrieval]
-enabled      = true
-# Weaviate runs in Docker, mapped to localhost:8090
-weaviate_url = "http://localhost:8090"
+enabled     = true
+# Qdrant runs locally as a native binary (bin/qdrant.exe)
+# No Docker required. Start with start_fixed.ps1 or run bin\qdrant.exe directly.
+qdrant_url  = "http://localhost:6333"
 
 embed_model     = "BAAI/bge-m3"
-embed_device    = "cuda"
+embed_device    = "cpu"
 reranker_model  = "BAAI/bge-reranker-large"
-reranker_device = "cuda"
+reranker_device = "cpu"
 
 top_k        = 20
 rerank_top_n = 5
 hybrid_alpha = 0.75
 max_hops     = 2
 
-chunk_size    = 512
-chunk_overlap = 64
+# 1600 chars ~ 400 tokens for bge-m3 (512-token limit)
+# Better utilisation than the previous 512-char (128-token) default
+chunk_size    = 1600
+chunk_overlap = 200
 
 [ingestion]
 default_parser     = "auto"
@@ -86,7 +89,7 @@ supported_types = [
 ]
 
 [knowledge_graph]
-enabled               = true
+enabled               = false
 db_path               = "database/sqlite/knowledge_graph.db"
 extraction_batch_size = 5
 min_edge_confidence   = 0.6
@@ -109,8 +112,7 @@ enabled    = true
 skills_dir = "backend/skills/definitions"
 
 [tools]
-web_search_enabled  = true
-# searxng_url kept for future SearXNG re-integration
+web_search_enabled  = false
 searxng_url         = "http://localhost:8888"
 searxng_categories  = "general"
 searxng_language    = "en"

@@ -1,13 +1,10 @@
 """
 backend/shared/config.py
 ========================
-Loads configuration from config/settings.toml.
-Environment variable overrides use the PAEKA_ prefix with __ nesting.
+Application configuration.
 
-  PAEKA_LLM__BASE_URL=http://...
-  PAEKA_RETRIEVAL__ENABLED=true
-  PAEKA_SECURITY__CONTENT_SCAN_ENABLED=true
-  PAEKA_DEPLOY_MODE=production
+Change: RetrievalSettings gains qdrant_url field.
+        weaviate_url kept for backward compat but no longer used by app.py.
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class AppSettings(BaseModel):
     name: str = "PAEKA"
-    version: str = "0.10.0"
+    version: str = "0.11.3"
     description: str = "Personal AI Engineering & Knowledge Assistant"
     debug: bool = False
 
@@ -35,39 +32,29 @@ class ServerSettings(BaseModel):
 
 
 class LLMSettings(BaseModel):
-    # ── Provider selection ────────────────────────────────────────────
-    # "llama_cpp"  (primary — GGUF-native, CPU+GPU offload)
-    # "ollama"     (optional — good for Mac / model management GUI)
-    # "sglang"     (optional — large multi-GPU deployments only)
-    provider: str = "llama_cpp"
+    # "ollama"    (default - install from https://ollama.com/download/windows)
+    # "llama_cpp" (legacy - native binary, more config required)
+    # "sglang"    (multi-GPU deployments)
+    provider: str = "ollama"
 
-    # ── Connection ────────────────────────────────────────────────────
-    base_url: str = "http://localhost:8080/v1"   # llama.cpp default port
-    api_key: str = "paeka-local"                 # ignored by llama.cpp
+    base_url: str = "http://localhost:11434/v1"
+    api_key: str = "ollama"
 
-    # ── Model ─────────────────────────────────────────────────────────
-    # For llama.cpp:  path to the .gguf file on the HOST filesystem
-    #                 (mounted into the container at /models)
-    # For ollama:     model tag, e.g. "qwen3:35b"
-    # For sglang:     HuggingFace repo id, e.g. "Qwen/Qwen3-14B-Instruct"
-    model: str = "paeka-model"          # displayed name / tag / repo id
-    model_path: str = ""                # absolute path to .gguf (llama.cpp only)
+    model: str = "paeka-qwen"
+    model_path: str = ""
 
-    # ── Generation parameters ─────────────────────────────────────────
     max_tokens: int = 4096
     temperature: float = 0.7
-    top_p: float = 0.9
+    top_p: float = 0.8
     stream: bool = True
-    request_timeout: int = 180          # generous for large GGUF models
+    request_timeout: int = 180
 
-    # ── System prompt ─────────────────────────────────────────────────
     system_prompt: str = "You are PAEKA, a helpful AI assistant."
 
 
 class ModelSettings(BaseModel):
-    """Configuration for the local model management layer."""
-    models_dir: str = "models"            # root directory for .gguf files
-    auto_scan: bool = True                # scan on startup
+    models_dir: str = "models"
+    auto_scan: bool = True
 
 
 class DatabaseSettings(BaseModel):
@@ -83,16 +70,26 @@ class MemorySettings(BaseModel):
 
 class RetrievalSettings(BaseModel):
     enabled: bool = False
-    weaviate_url: str = "http://localhost:8080"
+
+    # Qdrant (primary vector store)
+    qdrant_url: str = "http://localhost:6333"
+
+    # Weaviate kept for backward compat - not used by current app.py
+    weaviate_url: str = "http://localhost:8090"
+
     embed_model: str = "BAAI/bge-m3"
-    embed_device: str = "cuda"
+    embed_device: str = "cpu"
     reranker_model: str = "BAAI/bge-reranker-large"
-    reranker_device: str = "cuda"
+    reranker_device: str = "cpu"
+
     top_k: int = 20
     rerank_top_n: int = 5
     hybrid_alpha: float = 0.75
-    chunk_size: int = 512
-    chunk_overlap: int = 64
+
+    # 1600 chars ~ 400 tokens for bge-m3 (512-token limit)
+    chunk_size: int = 1600
+    chunk_overlap: int = 200
+
     max_hops: int = 2
 
 
@@ -163,37 +160,18 @@ class ToolsSettings(BaseModel):
 
 
 class SecuritySettings(BaseModel):
-    """
-    Content security, authentication, and rate limiting.
-
-    These are primarily set via environment variables (from .env)
-    rather than settings.toml, since auth tokens should never be
-    committed to version control.
-    """
-    # Content scanning
     content_scan_enabled: bool = True
-    strict_mode: bool = False          # promote WARN→BLOCK; recommended for Mode 3
-
-    # Authentication
-    enabled: bool = False              # set true for LAN / internet deployments
-    token: str = ""                    # set via PAEKA_AUTH__TOKEN env var
-
-    # Rate limiting
-    rate_limit_enabled: bool = False   # set true for LAN / internet deployments
+    strict_mode: bool = False
+    enabled: bool = False
+    token: str = ""
+    rate_limit_enabled: bool = False
     chat_rpm: int = 20
     upload_rpm: int = 10
     default_rpm: int = 120
 
 
 class DeploymentSettings(BaseModel):
-    """
-    Deployment context — controls which security features activate.
-
-    "development"  — localhost, no auth, no rate limiting
-    "lan"          — local network, auth + self-signed TLS
-    "production"   — internet-facing, auth + Let's Encrypt TLS + rate limiting
-    """
-    mode: str = "development"   # development | lan | production
+    mode: str = "development"
     domain: str = "localhost"
 
     @property
@@ -237,11 +215,9 @@ class Settings(BaseSettings):
     tool_calling: ToolCallingSettings = Field(default_factory=ToolCallingSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
-    # Top-level deploy mode shortcut (PAEKA_DEPLOY_MODE=production)
     deploy_mode: str = "development"
 
     def model_post_init(self, __context: Any) -> None:
-        # Sync top-level PAEKA_DEPLOY_MODE into deploy.mode
         if self.deploy_mode != "development" and self.deploy.mode == "development":
             object.__setattr__(self, "deploy",
                 DeploymentSettings(mode=self.deploy_mode, domain=self.deploy.domain))
@@ -256,6 +232,5 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def get_settings(config_path: str = "config/settings.toml") -> Settings:
-    """Return the cached Settings singleton."""
     raw = _load_toml(Path(config_path))
     return Settings(**raw)

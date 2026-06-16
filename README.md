@@ -150,57 +150,33 @@ backend/agent/tool_graph.py
 
 ## API Layer
 
-Located in:
-
 ```text
+# Located in:
 backend/api/
-```
 
-Provides:
-
-### Conversation Management
-
-```text
+# Provides:
+# Conversation Management
 /api/conversations
-```
 
-### Chat
-
-```text
+# Chat
 /api/conversations/{id}/chat
-```
 
-### Documents
-
-```text
+# Documents
 /api/documents
-```
 
-### Memory
-
-```text
+# Memory
 /api/memory
-```
 
-### Knowledge Graph
-
-```text
+# Knowledge Graph
 /api/knowledge
-```
 
-### Models
-
-```text
+# Models
 /api/models
-```
 
-### OpenAI Compatibility
-
-```text
+# OpenAI Compatibility
 /v1/models
 /v1/chat/completions
 ```
-
 ---
 
 ## Retrieval System
@@ -238,14 +214,12 @@ backend/knowledge/
 ```
 
 Provides:
-
 * Entity extraction
 * Relationship extraction
 * Graph storage
 * Graph-assisted retrieval
 
 Supported entity types include:
-
 * Concepts
 * Algorithms
 * Frameworks
@@ -266,7 +240,6 @@ backend/memory/
 ```
 
 Features:
-
 * Conversation persistence
 * Session memory
 * Automatic summarization
@@ -296,7 +269,6 @@ Supported formats:
 | LaTeX    | ✓         |
 
 Features:
-
 * Chunking
 * Deduplication
 * Versioning
@@ -338,17 +310,15 @@ paeka/
 │
 └── tests/
 ```
-
 ---
 
 # Requirements
 
 ## Software
 
-* Python 3.12+
-* UV
-* Docker Desktop
-* Docker Compose
+* Python 3.12+ (preferably v3.14.2)
+* UV Package Manager
+* Docker Desktop 
 
 ## Optional
 
@@ -370,11 +340,7 @@ cd paeka
 
 ```bash
 uv sync
-```
-
-Development dependencies:
-
-```bash
+# Development dependencies:
 uv sync --extra dev
 ```
 
@@ -384,21 +350,15 @@ uv sync --extra dev
 
 ```bash
 docker compose up -d
-```
-
-Verify:
-
-```bash
+# Verify:
 curl http://localhost:8090/v1/.well-known/ready
 ```
-
 ---
 
 ## 4. Download a Model
 
-Example:
-
 ```bash
+# Example:
 uv run python scripts/download_model.py
 ```
 
@@ -441,7 +401,9 @@ enabled = true
 Windows:
 
 ```powershell
-.\scripts\start.ps1
+pwsh .\scripts\start.ps1
+# or use the "fixed" version (still has problems that needs to be resolved. NOTE: OneDrive usage does effect this program significantly)
+pwsh .\scripts\start_fixed.ps1
 ```
 
 Manual:
@@ -466,42 +428,28 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 | GET /api/models                   | Available models       |
 | POST /v1/chat/completions         | OpenAI-compatible chat |
 
-See:
+For complete documentation see the follwing document:
 
 ```text
 API_REFERENCE.md
 ```
-
-for complete documentation.
-
 ---
 
 # Development
 
-Run tests:
-
 ```bash
+# Run tests:
 uv run pytest
-```
 
 Lint:
-
-```bash
 uv run ruff check .
-```
 
 Format:
-
-```bash
 uv run ruff format .
-```
 
 Type checking:
-
-```bash
 uv run pyright
 ```
-
 ---
 
 # Documentation
@@ -526,7 +474,7 @@ Planned and partially implemented capabilities include:
 * SearXNG integration
 * MCP integrations
 * Advanced workflow automation
-* Rich web frontend
+* Fix database design and model server (more locally hostable friendly, and easier to scale into different tech stacks)
 
 ---
 

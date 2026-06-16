@@ -30,9 +30,19 @@ data/documents/
 data/images/
 data/uploads/
 data/exports/
+data/sandbox/
+
+# Vector store data - never commit these
+# Weaviate: had RAFT state committed accidentally; untrack with:
+#   git rm -r --cached database/weaviate/
+database/weaviate/
+
+# Qdrant
+database/qdrant/
 
 # Logs
 *.log
+logs/
 
 # Test artifacts
 .pytest_cache/
@@ -40,10 +50,13 @@ data/exports/
 htmlcov/
 .coverage
 
-# Model weights — never commit GGUF files
+# Model weights - never commit GGUF files
 models/**/*.gguf
 models/**/*.gguf.part
 
-# bin contents are too large to git_commit
+# bin contents are too large for git
 bin/*
 !bin/.gitkeep
+
+# Environment files - never commit secrets
+.env

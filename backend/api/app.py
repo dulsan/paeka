@@ -3,24 +3,28 @@ backend/api/app.py
 ==================
 FastAPI application factory.
 
+Changes from original:
+  [QDRANT]   WeaviateStore replaced with QdrantStore.
+             app.state.weaviate renamed to app.state.vector_store for clarity.
+             settings.retrieval.weaviate_url -> settings.retrieval.qdrant_url
+  [LLM-MSG]  LLM not-reachable warning no longer says "docker compose up paeka-llamacpp"
+             since we use Ollama now.
+
 Startup order:
   1. Logging
   2. SQLite
-  3. LLM client
-  4. Security (ContentScanner wired into app.state)
-  5. Retrieval + Agentic RAG pipeline
-  6. Memory
-  7. Knowledge graph
-  8. Skills
-
-Middleware stack (outermost → innermost):
-  RateLimitMiddleware → AuthMiddleware → CORSMiddleware → FastAPI routes
+  3. LLM provider (ollama by default via factory)
+  4. Content scanner
+  5. SearXNG web client
+  6. Retrieval + Agentic RAG pipeline (Qdrant-backed)
+  7. Memory
+  8. Knowledge graph
+  9. Skills
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -45,63 +49,57 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging(settings.logging.level, settings.logging.format)
     logger.info("Starting PAEKA v%s [mode=%s]", settings.app.version, settings.deploy.mode)
 
-    # ── 1. Database ──────────────────────────────────────────────────────
+    # 1. Database
     db = Database(settings.database.sqlite_path)
     await db.connect()
     app.state.db = db
 
-    # ── 2. Model registry (scan available GGUF files) ────────────────────
+    # 2. Model registry
     from backend.models.registry import ModelRegistry
     from backend.models.loader import resolve_model
     registry = ModelRegistry(settings.models.models_dir)
     if settings.models.auto_scan:
         models = registry.scan()
         if models:
-            logger.info(
-                "Available models: %s",
-                [f"{m.name} ({m.size_gb}GB)" for m in models],
-            )
+            logger.info("Available models: %s",
+                        [f"{m.name} ({m.size_gb}GB)" for m in models])
 
-    # Validate the configured model path (llama.cpp only; no-op for others)
     load_result = resolve_model(settings.llm, registry)
     if not load_result.ok:
         logger.warning("Model validation: %s", load_result.message)
     else:
         logger.info("Model: %s", load_result.message)
-
     app.state.model_registry = registry
 
-    # ── 3. LLM provider (factory selects llama_cpp / ollama / sglang) ────
+    # 3. LLM provider
     llm: LLMProvider = create_provider(settings.llm)
     app.state.llm = llm
 
-    # Configure chat_control with the llama base URL for slot management
-    from backend.api.routes.chat_control import configure as configure_chat  # noqa: PLC0415
+    from backend.api.routes.chat_control import configure as configure_chat
     configure_chat(llama_base_url=settings.llm.base_url)
 
     if await llm.health_check():
-        logger.info(
-            "%s reachable at %s", llm.provider_name, settings.llm.base_url
-        )
+        logger.info("%s reachable at %s", llm.provider_name, settings.llm.base_url)
     else:
         logger.warning(
-            "%s NOT reachable at %s — start with: docker compose up paeka-llamacpp -d",
+            "%s NOT reachable at %s",
             llm.provider_name, settings.llm.base_url,
         )
+        if settings.llm.provider == "ollama":
+            logger.warning("Start Ollama with: ollama serve")
+            logger.warning("Import model with: ollama create paeka-qwen -f models\\qwen\\Modelfile")
 
-    # ── 3. Content scanner ───────────────────────────────────────────────
+    # 4. Content scanner
     scanner = ContentScanner(
         enabled=settings.security.content_scan_enabled,
         strict_mode=settings.security.strict_mode,
     )
     app.state.scanner = scanner
-    logger.info(
-        "Content scanner: enabled=%s strict=%s",
-        settings.security.content_scan_enabled,
-        settings.security.strict_mode,
-    )
+    logger.info("Content scanner: enabled=%s strict=%s",
+                settings.security.content_scan_enabled,
+                settings.security.strict_mode)
 
-    # ── 3b. SearXNG web client ────────────────────────────────────────────
+    # 5. SearXNG web client
     app.state.web_client = None
     if settings.tools.web_search_enabled:
         from backend.tools.searxng import SearXNGClient
@@ -111,17 +109,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("Web search disabled (set PAEKA_TOOLS__WEB_SEARCH_ENABLED=true to enable)")
 
-    # ── 4. Retrieval + Agentic RAG pipeline ──────────────────────────────
+    # 6. Retrieval + Agentic RAG pipeline (Qdrant)
     app.state.retrieval      = None
     app.state.ingestion      = None
-    app.state.weaviate       = None
+    app.state.vector_store   = None   # renamed from app.state.weaviate
+    app.state.weaviate       = None   # kept as alias for any code that still references it
     app.state.agent_pipeline = None
 
     if settings.retrieval.enabled:
         try:
             from backend.retrieval.embedder import get_embedder
             from backend.retrieval.reranker import get_reranker
-            from backend.retrieval.weaviate_store import WeaviateStore
+            from backend.retrieval.qdrant_store import QdrantStore
             from backend.retrieval.engine import RetrievalEngine
             from backend.ingestion.pipeline import IngestionPipeline
             from backend.agent.graph import AgenticRAGPipeline
@@ -130,13 +129,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                                     settings.retrieval.embed_device)
             reranker = get_reranker(settings.retrieval.reranker_model,
                                     settings.retrieval.reranker_device)
-            store = WeaviateStore(url=settings.retrieval.weaviate_url,
-                                  vector_dim=embedder.dim)
+
+            qdrant_url = getattr(settings.retrieval, "qdrant_url",
+                                 "http://localhost:6333")
+            store = QdrantStore(url=qdrant_url, vector_dim=embedder.dim)
             await store.connect()
 
-            app.state.weaviate  = store
-            app.state.retrieval = RetrievalEngine(store, embedder, reranker,
-                                                   settings.retrieval)
+            app.state.vector_store = store
+            app.state.weaviate     = store   # alias
+            app.state.retrieval    = RetrievalEngine(
+                store, embedder, reranker, settings.retrieval
+            )
             app.state.ingestion = IngestionPipeline(
                 db, store, embedder,
                 settings.retrieval,
@@ -150,19 +153,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 web_client=app.state.web_client,
                 max_hops=settings.retrieval.max_hops,
             )
-            logger.info("Retrieval + Agentic RAG pipeline ready.")
+            logger.info("Retrieval + Agentic RAG pipeline ready (Qdrant).")
         except Exception as exc:
             logger.error("Retrieval init failed: %s", exc)
             logger.warning("Continuing without retrieval.")
 
-    # ── 5. Memory ────────────────────────────────────────────────────────
+    # 7. Memory
     app.state.memory = None
     if settings.memory.enabled:
         from backend.memory.service import MemoryService
         app.state.memory = MemoryService(db, llm, settings.memory)
         logger.info("Memory service ready.")
 
-    # ── 6. Knowledge graph ───────────────────────────────────────────────
+    # 8. Knowledge graph
     app.state.kg_repo      = None
     app.state.kg_extractor = None
     app.state.kg_refiner   = None
@@ -179,7 +182,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             app.state.kg_repo      = kg_repo
             app.state.kg_extractor = KnowledgeGraphExtractor(
                 kg_repo, llm, settings.knowledge_graph)
-            app.state.kg_refiner   = GraphRefiner(kg_repo, llm, settings.knowledge_graph)
+            app.state.kg_refiner = GraphRefiner(kg_repo, llm, settings.knowledge_graph)
             kg_ret = GraphRetriever(kg_repo, settings.knowledge_graph)
             await kg_ret.load_graph()
             app.state.kg_retriever = kg_ret
@@ -192,7 +195,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as exc:
             logger.error("Knowledge graph init failed: %s", exc)
 
-    # ── 7. Skills ────────────────────────────────────────────────────────
+    # 9. Skills
     app.state.skills = None
     if settings.skills.enabled:
         from backend.skills.manager import SkillsManager
@@ -203,9 +206,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    logger.info("Shutting down PAEKA…")
-    if app.state.weaviate:
-        await app.state.weaviate.close()
+    logger.info("Shutting down PAEKA...")
+    if app.state.vector_store:
+        await app.state.vector_store.close()
     if app.state.web_client:
         await app.state.web_client.close()
     await llm.close()
@@ -227,9 +230,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ── Middleware (added in reverse order — last added = outermost) ──────
-
-    # CORS — restrict origins in non-development modes
     cors_origins = (
         ["*"] if dep.mode == "development"
         else [f"https://{dep.domain}"]
@@ -241,15 +241,7 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "X-API-Key", "Content-Type"],
     )
-
-    # Auth middleware — token from env, enabled via settings
-    app.add_middleware(
-        AuthMiddleware,
-        token=sec.token,
-        enabled=sec.enabled,
-    )
-
-    # Rate limiting — only meaningful for LAN/production
+    app.add_middleware(AuthMiddleware, token=sec.token, enabled=sec.enabled)
     app.add_middleware(
         RateLimitMiddleware,
         enabled=sec.rate_limit_enabled,
@@ -258,8 +250,7 @@ def create_app() -> FastAPI:
         default_rpm=sec.default_rpm,
     )
 
-    # ── Routes ────────────────────────────────────────────────────────────
-    from backend.api.routes import (  # noqa: PLC0415
+    from backend.api.routes import (
         health, conversations, chat, documents, memory, knowledge,
         skills, code, export, models, sandbox, agent,
         openai_compat, chat_control,
