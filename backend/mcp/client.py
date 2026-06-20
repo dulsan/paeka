@@ -43,6 +43,22 @@ _schema_cache: list[dict] | None = None
 _cache_lock = asyncio.Lock()
 
 
+def _get_local_tool_manager() -> Any | None:
+    """
+    Return the in-process FastMCP tool manager when the server is running in
+    the same Python interpreter as the caller.
+
+    This avoids an unnecessary HTTP round trip for the common in-app case and
+    sidesteps MCP transport/session failures when the caller is already inside
+    the FastAPI worker process.
+    """
+    try:
+        from backend.mcp.server import mcp as local_mcp
+    except Exception:
+        return None
+    return getattr(local_mcp, "_tool_manager", None)
+
+
 def _log_unwrapped(context: str, exc: BaseException, _depth: int = 0) -> None:
     """
     Log the real cause of a failure, not just a generic wrapper message.
@@ -83,14 +99,27 @@ def invalidate_schema_cache() -> None:
 
 
 def _mcp_tool_to_openai(tool: Any) -> dict:
+    schema = getattr(tool, "inputSchema", None) or getattr(tool, "parameters", None) or {}
     return {
         "type": "function",
         "function": {
             "name":        tool.name,
-            "description": tool.description or "",
-            "parameters":  tool.inputSchema,
+            "description": (tool.description or "").strip(),
+            "parameters":  schema,
         },
     }
+
+
+def _tool_result_to_text(result: Any) -> str:
+    content = getattr(result, "content", None)
+    if not content:
+        return str(result)
+
+    texts = [
+        block.text for block in content
+        if hasattr(block, "text") and block.text
+    ]
+    return "\n".join(texts) if texts else "(tool returned no output)"
 
 
 @asynccontextmanager
@@ -119,6 +148,19 @@ async def get_tool_schemas(
     async with _cache_lock:
         if _schema_cache is not None and not force_refresh:
             return _schema_cache
+
+        local_manager = _get_local_tool_manager()
+        if local_manager is not None:
+            try:
+                schemas = [_mcp_tool_to_openai(t) for t in local_manager.list_tools()]
+                _schema_cache = schemas
+                logger.info("MCP client: discovered %d local tools: %s",
+                            len(schemas), [s["function"]["name"] for s in schemas])
+                return schemas
+            except Exception as exc:
+                logger.warning("Local MCP tool discovery failed; falling back to HTTP transport")
+                _log_unwrapped("Local MCP schema fetch failure", exc)
+
         try:
             async with _get_session(mcp_url) as session:
                 result  = await session.list_tools()
@@ -152,13 +194,18 @@ async def call_tool(
         return f"[MCP ERROR] Argument validation failed for '{name}': {exc}"
 
     try:
+        local_manager = _get_local_tool_manager()
+        if local_manager is not None:
+            try:
+                result = await local_manager.call_tool(name, arguments)
+                return _tool_result_to_text(result)
+            except Exception as exc:
+                logger.warning("Local MCP tool call '%s' failed; falling back to HTTP transport", name)
+                _log_unwrapped(f"Local MCP tool call '{name}' failed", exc)
+
         async with _get_session(mcp_url) as session:
             result = await session.call_tool(name, arguments)
-            texts = [
-                block.text for block in result.content
-                if hasattr(block, "text") and block.text
-            ]
-            return "\n".join(texts) if texts else "(tool returned no output)"
+            return _tool_result_to_text(result)
     except Exception as exc:
         _log_unwrapped(f"MCP tool call '{name}' failed", exc)
         return f"[MCP ERROR] {name}: {exc}"

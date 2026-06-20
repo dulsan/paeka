@@ -187,6 +187,21 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
     """
     from backend.agent.react_graph import ReActGraph
 
+    llm = getattr(request.app.state, "llm", None)
+    if llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM provider not initialised. Check app startup logs.",
+        )
+    if not await llm.health_check():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{llm.provider_name} backend is unreachable. "
+                "Start the backend and retry."
+            ),
+        )
+
     chat_ollama = getattr(request.app.state, "chat_ollama", None)
     if chat_ollama is None:
         raise HTTPException(
