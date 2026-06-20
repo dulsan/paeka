@@ -23,6 +23,30 @@ Set in settings.toml:
   provider = "ollama"
   base_url = "http://localhost:11434/v1"
   model    = "qwen3:35b"    # Ollama model tag
+
+[FIX] Path constants previously duplicated the "/v1" segment that the
+httpx.AsyncClient's base_url already supplies.
+
+settings.base_url is "http://localhost:11434/v1" and that full string is
+passed as base_url= to httpx.AsyncClient. httpx's base_url + relative-path
+merging concatenates the base_url's existing path with the request path
+rather than replacing it (confirmed empirically: AsyncClient(base_url=
+"http://localhost:11434/v1")._merge_url("/v1/models") produces
+"http://localhost:11434/v1/v1/models", not the single-/v1 URL one might
+expect from standard RFC 3986 reference resolution).
+
+With _COMPLETIONS = "/v1/chat/completions" and _MODELS = "/v1/models", every
+single request this provider made -- chat completions AND the health check
+-- was hitting a doubled .../v1/v1/... path and 404ing. This explains
+"ollama NOT reachable" warnings even when Ollama is actually running, and
+means actual chat completions through this provider were broken outright,
+not just the health check.
+
+Fix: the path constants now omit the "/v1" prefix entirely, since base_url
+already supplies it. _TAGS is unaffected by this specific bug (it isn't
+called anywhere currently) but is flagged below: if it's ever wired up,
+it needs its own request that bypasses base_url's "/v1" suffix, since
+Ollama's native /api/tags endpoint sits at the host root, not under /v1.
 """
 
 from __future__ import annotations
@@ -39,9 +63,20 @@ from backend.shared.config import LLMSettings
 
 logger = logging.getLogger(__name__)
 
-_COMPLETIONS = "/v1/chat/completions"
-_MODELS      = "/v1/models"
-_TAGS        = "/api/tags"   # Ollama-native endpoint for model listing
+# [FIX] base_url (e.g. "http://localhost:11434/v1") already supplies the
+# "/v1" segment. These are relative to that base_url, so they must NOT
+# repeat it -- httpx concatenates base_url's path with these, it does not
+# replace it.
+_COMPLETIONS = "/chat/completions"
+_MODELS      = "/models"
+
+# NOT relative to base_url's "/v1" -- Ollama's native API lives at the host
+# root (http://localhost:11434/api/tags), a sibling of /v1, not nested
+# under it. Currently unused (list_models() uses the OpenAI-compat path via
+# _MODELS instead). If this is ever wired up, it needs a request that
+# bypasses self._http's base_url -- e.g. a second httpx.AsyncClient with no
+# base_url path component, or an absolute URL passed directly to .get().
+_TAGS = "/api/tags"
 
 
 class OllamaProvider(LLMProvider):

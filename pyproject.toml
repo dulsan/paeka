@@ -66,6 +66,38 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
 
+    # -- ReAct loop: native function calling via Ollama directly ----------
+    # [MIGRATION] litellm removed -- it was an extra abstraction layer that
+    # caused several real, concrete problems in this project (a default
+    # ~15s startup delay fetching a GitHub-hosted cost-map file irrelevant
+    # to a free local model, internal Pydantic settings models flooding
+    # the trace, version-coupling overhead) without a benefit that
+    # mattered here: we only ever talk to one provider, Ollama. Verified
+    # before removing: langchain-ollama's ChatOllama.bind_tools() accepts
+    # our existing OpenAI-format MCP tool schemas directly, and its
+    # AIMessage.tool_calls already returns the exact LangChain-native
+    # shape backend/agent/react_graph.py's tool_node already consumed --
+    # so this isn't just a swap, it's also a genuine simplification.
+    "langchain-ollama>=0.2.0",
+
+    # -- MCP (Model Context Protocol) --------------------------------------
+    # FastMCP server mounted at /mcp inside the FastAPI process.
+    # streamable_http_app() requires mcp>=1.1.0; if pinned to mcp==1.0.x,
+    # backend/mcp/client.py falls back to sse_client automatically.
+    "mcp>=1.1.0",
+
+    # -- Observability (Phase 1, Step 1) -----------------------------------
+    # Local-only tracing (send_to_logfire=False, no account, nothing leaves
+    # the machine). The [httpx] extra pulls in opentelemetry-instrumentation-
+    # httpx, required by logfire.instrument_httpx() -- without it that one
+    # call raises RuntimeError (now caught individually in logfire_setup.py
+    # so it can't crash the whole app, but better to just install it properly).
+    # Optional at the package level -- the app runs fine without logfire at
+    # all (backend/observability/logfire_setup.py degrades to a no-op), but
+    # it is the explicit Phase 1 priority so it is a core dep, not an extra,
+    # for now.
+    "logfire[httpx]>=3.0.0",
+
     # -- Utilities ---------------------------------------------------------
     "rich>=13.9.0",
     "typer>=0.15.0",

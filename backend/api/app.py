@@ -3,23 +3,20 @@ backend/api/app.py
 ==================
 FastAPI application factory.
 
-Changes from original:
-  [QDRANT]   WeaviateStore replaced with QdrantStore.
-             app.state.weaviate renamed to app.state.vector_store for clarity.
-             settings.retrieval.weaviate_url -> settings.retrieval.qdrant_url
-  [LLM-MSG]  LLM not-reachable warning no longer says "docker compose up paeka-llamacpp"
-             since we use Ollama now.
-
 Startup order:
-  1. Logging
-  2. SQLite
-  3. LLM provider (ollama by default via factory)
+  0. Observability (Logfire, local-only -- must be first so it can trace
+     everything after it, including Pydantic validation during settings load)
+  1. Database
+  2. Model registry
+  3. LLM provider (Ollama by default via factory)
   4. Content scanner
   5. SearXNG web client
   6. Retrieval + Agentic RAG pipeline (Qdrant-backed)
   7. Memory
   8. Knowledge graph
   9. Skills
+  10. Sandbox (Docker code execution, hardened)
+  11. MCP server: inject services, mount at /mcp
 """
 
 from __future__ import annotations
@@ -45,9 +42,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    # 0. Observability -- first, so everything after this point is traced.
+    from backend.observability.logfire_setup import configure_observability
+    observability_active = configure_observability()
+
     settings = get_settings()
     setup_logging(settings.logging.level, settings.logging.format)
-    logger.info("Starting PAEKA v%s [mode=%s]", settings.app.version, settings.deploy.mode)
+    logger.info("Starting PAEKA v%s [mode=%s] [observability=%s]",
+                settings.app.version, settings.deploy.mode, observability_active)
 
     # 1. Database
     db = Database(settings.database.sqlite_path)
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Model: %s", load_result.message)
     app.state.model_registry = registry
 
-    # 3. LLM provider
+    # 3. LLM provider (main conversational provider, e.g. Ollama)
     llm: LLMProvider = create_provider(settings.llm)
     app.state.llm = llm
 
@@ -81,13 +83,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if await llm.health_check():
         logger.info("%s reachable at %s", llm.provider_name, settings.llm.base_url)
     else:
-        logger.warning(
-            "%s NOT reachable at %s",
-            llm.provider_name, settings.llm.base_url,
-        )
+        logger.warning("%s NOT reachable at %s", llm.provider_name, settings.llm.base_url)
         if settings.llm.provider == "ollama":
             logger.warning("Start Ollama with: ollama serve")
             logger.warning("Import model with: ollama create paeka-qwen -f models\\qwen\\Modelfile")
+
+    # 3b. ChatOllama (used only by ReActGraph for native function calling)
+    # [MIGRATION] Replaces LiteLLMProvider entirely -- see react_graph.py's
+    # module docstring for what was verified before making this change.
+    #
+    # settings.llm.base_url is "http://localhost:11434/v1" -- that "/v1"
+    # suffix is specifically for OllamaProvider's OpenAI-compat HTTP calls
+    # (backend/llm/ollama.py) and openai_compat.py's pass-through route.
+    # ChatOllama talks to Ollama's NATIVE /api/chat endpoint instead (not
+    # the OpenAI-compat layer), which doesn't use a "/v1" prefix at all --
+    # confirmed this is langchain-ollama's actual behavior, not an
+    # OpenAI-compat wrapper, before relying on it. Strip the suffix here
+    # rather than introduce a second, separately-configured base URL.
+    from langchain_ollama import ChatOllama
+    _ollama_native_base = settings.llm.base_url.rstrip("/")
+    if _ollama_native_base.endswith("/v1"):
+        _ollama_native_base = _ollama_native_base[: -len("/v1")]
+
+    app.state.chat_ollama = ChatOllama(
+        model=settings.llm.model,
+        base_url=_ollama_native_base,
+        temperature=0.7,
+        num_predict=4096,  # Ollama's native name for max output tokens
+        client_kwargs={"timeout": 180.0},
+    )
+    logger.info("ChatOllama: model=%s base=%s", settings.llm.model, _ollama_native_base)
 
     # 4. Content scanner
     scanner = ContentScanner(
@@ -112,9 +137,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # 6. Retrieval + Agentic RAG pipeline (Qdrant)
     app.state.retrieval      = None
     app.state.ingestion      = None
-    app.state.vector_store   = None   # renamed from app.state.weaviate
-    app.state.weaviate       = None   # kept as alias for any code that still references it
+    app.state.vector_store   = None
+    app.state.weaviate       = None
     app.state.agent_pipeline = None
+    app.state.embedder       = None
 
     if settings.retrieval.enabled:
         try:
@@ -127,24 +153,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             embedder = get_embedder(settings.retrieval.embed_model,
                                     settings.retrieval.embed_device)
+            app.state.embedder = embedder
             reranker = get_reranker(settings.retrieval.reranker_model,
                                     settings.retrieval.reranker_device)
 
-            qdrant_url = getattr(settings.retrieval, "qdrant_url",
-                                 "http://localhost:6333")
+            qdrant_url = getattr(settings.retrieval, "qdrant_url", "http://localhost:6333")
             store = QdrantStore(url=qdrant_url, vector_dim=embedder.dim)
             await store.connect()
 
             app.state.vector_store = store
-            app.state.weaviate     = store   # alias
-            app.state.retrieval    = RetrievalEngine(
-                store, embedder, reranker, settings.retrieval
-            )
+            app.state.weaviate     = store
+            app.state.retrieval    = RetrievalEngine(store, embedder, reranker, settings.retrieval)
             app.state.ingestion = IngestionPipeline(
-                db, store, embedder,
-                settings.retrieval,
-                settings.ingestion,
-                scanner=scanner,
+                db, store, embedder, settings.retrieval, settings.ingestion, scanner=scanner,
             )
             app.state.agent_pipeline = AgenticRAGPipeline(
                 llm=llm,
@@ -180,9 +201,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             kg_repo = KnowledgeGraphRepository(db)
             app.state.kg_repo      = kg_repo
-            app.state.kg_extractor = KnowledgeGraphExtractor(
-                kg_repo, llm, settings.knowledge_graph)
-            app.state.kg_refiner = GraphRefiner(kg_repo, llm, settings.knowledge_graph)
+            app.state.kg_extractor = KnowledgeGraphExtractor(kg_repo, llm, settings.knowledge_graph)
+            app.state.kg_refiner   = GraphRefiner(kg_repo, llm, settings.knowledge_graph)
             kg_ret = GraphRetriever(kg_repo, settings.knowledge_graph)
             await kg_ret.load_graph()
             app.state.kg_retriever = kg_ret
@@ -204,7 +224,64 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.skills = mgr
         logger.info("Skills loaded: %d", len(mgr.list_skills()))
 
-    yield
+    # 10. Sandbox (hardened Docker code execution -- exists already in
+    # backend/agent/sandbox.py but was never instantiated into app.state.
+    # Wired here so the execute_code MCP tool actually has something to call
+    # instead of silently returning "Docker sandbox is not available".
+    app.state.sandbox = None
+    if settings.sandbox.enabled:
+        try:
+            from backend.agent.sandbox import get_sandbox
+            sandbox = get_sandbox()
+            available = await sandbox.is_available()
+            app.state.sandbox = sandbox
+            logger.info("Sandbox ready (docker_available=%s)", available)
+            if not available:
+                logger.warning("Docker not reachable -- execute_code tool will fail until Docker is running.")
+        except Exception as exc:
+            logger.error("Sandbox init failed: %s", exc)
+
+    # 11. MCP server: inject services, mount at /mcp
+    mcp_server = None
+    try:
+        from backend.mcp.server import mcp as mcp_server
+        from backend.mcp.server import configure as configure_mcp
+        configure_mcp(
+            store=app.state.vector_store,
+            embedder=app.state.embedder,
+            llm=llm,
+            web_client=app.state.web_client,
+            sandbox=app.state.sandbox,
+        )
+        logger.info("MCP server configured.")
+    except Exception as exc:
+        logger.error("MCP server configuration failed: %s", exc)
+
+    # [FIX] Confirmed root cause of "McpError: Session terminated" on every
+    # MCP client call, including PAEKA's own self-call from react_graph.py:
+    # app.mount("/mcp", mcp_server.streamable_http_app()) in create_app()
+    # does NOT automatically run streamable_http_app()'s own lifespan --
+    # FastAPI/Starlette does not propagate lifespan execution into mounted
+    # sub-applications just because they're mounted (confirmed against an
+    # official modelcontextprotocol/python-sdk GitHub issue, #1467,
+    # describing this exact symptom, plus several independent working
+    # examples using the same fix). Without mcp_server.session_manager.run()
+    # actually active, the session manager's internal task group never
+    # initializes, so it has no concept of an "active" session at all --
+    # every session immediately looks terminated because nothing was ever
+    # tracking it as alive in the first place.
+    #
+    # This context needs to stay open for the server's entire serving
+    # lifetime, so it wraps the yield (and shutdown) rather than just being
+    # entered and exited around step 11 alone.
+    if mcp_server is not None:
+        async with mcp_server.session_manager.run():
+            logger.info("MCP session manager started.")
+            yield
+    else:
+        # MCP server failed to import/configure above -- still yield so the
+        # rest of the app serves normally, just without MCP tool-calling.
+        yield
 
     logger.info("Shutting down PAEKA...")
     if app.state.vector_store:
@@ -230,10 +307,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    cors_origins = (
-        ["*"] if dep.mode == "development"
-        else [f"https://{dep.domain}"]
-    )
+    cors_origins = ["*"] if dep.mode == "development" else [f"https://{dep.domain}"]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -269,5 +343,13 @@ def create_app() -> FastAPI:
     app.include_router(agent.router,         prefix="/api")
     app.include_router(openai_compat.router, prefix="/v1")
     app.include_router(chat_control.router,  prefix="/api")
+
+    # Mount MCP server at /mcp. streamable_http_app() requires mcp>=1.1.0.
+    try:
+        from backend.mcp.server import mcp as mcp_server
+        app.mount("/mcp", mcp_server.streamable_http_app())
+        logger.debug("MCP server mounted at /mcp")
+    except Exception as exc:
+        logger.warning("MCP server mount failed: %s", exc)
 
     return app

@@ -7,9 +7,24 @@
 #   Extract qdrant.exe to: bin\qdrant.exe
 
 storage:
-  # Data persists here across restarts
-  # Use a local path outside OneDrive to avoid file lock issues
-  storage_path: ./database/qdrant
+  # [FIX] Previously ./database/qdrant -- a relative path that resolves
+  # against whatever directory qdrant.exe is launched from, which in
+  # practice is the project root, i.e. still inside OneDrive. The comment
+  # already said "use a local path outside OneDrive" but the value never
+  # actually did that. Qdrant's own startup log confirms the risk directly:
+  #   "There is a potential issue with the filesystem for storage path
+  #    ./database/qdrant. Filesystem type check is not supported on this
+  #    platform" -- meaning Qdrant can't even verify the filesystem type on
+  #    Windows, so it can't tell you whether OneDrive's sync layer is safe
+  #    for its append-only WAL/mmap storage. Better to just not be there.
+  #
+  # MIGRATION NEEDED: if you already have data in the old location, copy it
+  # over BEFORE starting Qdrant with this config, or you'll start with an
+  # empty collection:
+  #   robocopy "database\qdrant" "C:\PaekaData\qdrant" /E
+  # (adjust C:\PaekaData to wherever you'd rather keep it -- anywhere
+  # outside OneDrive's sync scope is fine.)
+  storage_path: C:\PaekaData\qdrant
 
 service:
   host: 0.0.0.0
@@ -18,8 +33,14 @@ service:
   # Max upload size (bytes) - 100 MB for large document batches
   max_request_size_mb: 256
 
-# Disable anonymous telemetry
-telemetry:
-  disabled: true
+# [FIX] Was nested as `telemetry: disabled: true` -- not Qdrant's actual
+# schema. Confirmed against Qdrant's own config reference, telemetry docs,
+# and the canonical config.yaml template: this is a flat top-level key,
+# telemetry_disabled, not a nested telemetry.disabled. The nested form
+# doesn't match any recognized field, so Qdrant's config parser silently
+# ignored the whole block and fell back to its default (telemetry ON) --
+# exactly what the startup log showed ("Telemetry reporting enabled").
+# Read more: https://qdrant.tech/documentation/guides/usage-statistics/
+telemetry_disabled: true
 
 log_level: INFO

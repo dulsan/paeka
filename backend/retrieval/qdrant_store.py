@@ -74,8 +74,29 @@ class QdrantStore:
         self._client: AsyncQdrantClient | None = None
 
     async def connect(self) -> None:
-        """Open connection and create the chunks collection if it does not exist."""
-        self._client = AsyncQdrantClient(url=self._url)
+        """
+        Open connection and create the chunks collection if it does not exist.
+
+        [FIX] check_compatibility=False added below. qdrant-client's own
+        AsyncQdrantClient tries to fetch the server version on first use to
+        verify client/server compatibility; when that check itself fails
+        (independent of whether the main connection succeeds), it raises a
+        UserWarning -- "Failed to obtain server version... Set
+        check_compatibility=False to skip version check." That's a
+        recommendation straight from the SDK's own warning message for a
+        check we don't need: this is a single local binary we control and
+        know the version of, not a fleet of servers at unknown versions.
+
+        If you see "Retrieval init failed: All connection attempts failed"
+        in the startup log, that is a separate, more fundamental issue --
+        it means Qdrant isn't reachable at self._url at all, almost always
+        because bin\\qdrant.exe isn't running yet. Confirm with:
+            curl http://localhost:6333/healthz
+        in a separate terminal before starting PAEKA. check_compatibility
+        has no effect on that failure mode; it only silences the separate
+        version-check warning that can fire on its own schedule.
+        """
+        self._client = AsyncQdrantClient(url=self._url, check_compatibility=False)
 
         exists = await self._client.collection_exists(_COLLECTION)
         if not exists:

@@ -1,25 +1,50 @@
 """
 backend/ingestion/pipeline.py
 ==============================
-Document ingestion pipeline (v0.11.0).
+Document ingestion pipeline.
+
+Fixes applied:
+  [FIX-IMPORT] weaviate_store no longer exists (weaviate-client was removed
+               from pyproject.toml during the Qdrant migration). Import and
+               type hints updated to QdrantStore.
+
+  [FIX-AWAIT]  Four calls to async store methods were missing await:
+               delete_document_chunks() x3, upsert_chunks() x1. The
+               upsert_chunks one was the more serious of the two -- its
+               result (wids) feeds directly into zip(chunks, wids) a few
+               lines later, which would have raised TypeError on an
+               unawaited coroutine the moment this path was first hit.
+               The three missing awaits on delete_document_chunks() would
+               not raise, but would silently no-op: the coroutine gets
+               created and immediately garbage collected without ever
+               running, so old chunks never actually get deleted from
+               Qdrant on re-ingest or document deletion.
+
+  [FIX-ASYNC]  parse_file() is a synchronous, CPU-bound call (5-60s for
+               dense PDFs via Docling). It was called directly inside
+               async ingest_file() with no thread offload, blocking the
+               entire event loop -- including health checks and any other
+               concurrent request -- for the full parse duration. Wrapped
+               in asyncio.to_thread().
+
+  [FIX-ASYNC2] embedder.encode() (batch) is likewise synchronous and
+               CPU/GPU-bound. The Embedder class already exposes
+               encode_async() for exactly this case (it was already used
+               correctly elsewhere via encode_one_async()) -- this call
+               site just hadn't been switched over. Now uses encode_async().
 
 Two chunking paths:
-  1. Docling documents → HybridChunker (tokenisation-aware, structure-preserving)
-     Each DoclingDocument is chunked by Docling's own HybridChunker which:
-       a) Uses HierarchicalChunker to split along structural boundaries
-          (section → subsection → paragraph, tables/equations atomic)
-       b) Applies token-aware refinement so every chunk fits the embedding
-          model's context window exactly
-  2. Plain text / code / LaTeX / spreadsheets → layout-aware chunker
-     (existing TextChunk-based path)
+  1. Docling documents -> HybridChunker (tokenisation-aware, structure-preserving)
+  2. Plain text / code / LaTeX / spreadsheets -> layout-aware chunker
 
 Version-aware re-ingestion: changed files retire old chunks and replace them.
-Semantic deduplication: near-identical chunks (cosine ≥ 0.97) are skipped.
+Semantic deduplication: near-identical chunks (cosine >= 0.97) are skipped.
 Content security: each chunk scanned for injection patterns before storage.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from pathlib import Path
@@ -28,7 +53,7 @@ from backend.ingestion.parsers.dispatcher import content_hash, parse_file
 from backend.ingestion.repository import DocumentRepository
 from backend.retrieval.chunker import TextChunk, chunk_document, chunk_text
 from backend.retrieval.embedder import Embedder
-from backend.retrieval.weaviate_store import WeaviateStore
+from backend.retrieval.qdrant_store import QdrantStore
 from backend.shared.config import IngestionSettings, RetrievalSettings
 from backend.shared.database import Database
 
@@ -39,7 +64,7 @@ class IngestionPipeline:
     def __init__(
         self,
         db: Database,
-        store: WeaviateStore,
+        store: QdrantStore,
         embedder: Embedder,
         retrieval_settings: RetrievalSettings,
         ingestion_settings: IngestionSettings,
@@ -73,20 +98,24 @@ class IngestionPipeline:
 
         if existing:
             if existing.content_hash == file_hash and existing.status == "ready":
-                logger.info("Unchanged (hash match) — skipping: %s", path.name)
+                logger.info("Unchanged (hash match) -- skipping: %s", path.name)
                 return existing.id
             if self._isettings.versioning_enabled:
                 await self._retire_version(existing)
             else:
-                self._store.delete_document_chunks(existing.id)
+                await self._store.delete_document_chunks(existing.id)
                 await self._repo.delete_document(existing.id)
 
         import mimetypes
         mime_type, _ = mimetypes.guess_type(str(path))
         mime_type    = mime_type or "application/octet-stream"
 
-        parsed = parse_file(path, mode=self._isettings.default_parser)
-        doc    = await self._repo.create_document(
+        # [FIX-ASYNC] parse_file is synchronous and CPU-bound (5-60s for
+        # dense PDFs). Run it in a thread pool worker so it doesn't stall
+        # the event loop for the entire parse duration.
+        parsed = await asyncio.to_thread(parse_file, path, mode=self._isettings.default_parser)
+
+        doc = await self._repo.create_document(
             filename=path.name,
             filepath=str(path),
             mime_type=mime_type,
@@ -104,7 +133,7 @@ class IngestionPipeline:
 
         if existing:
             if existing.content_hash == file_hash and existing.status == "ready":
-                logger.info("Text unchanged — skipping: %s", filename)
+                logger.info("Text unchanged -- skipping: %s", filename)
                 return existing.id
             await self._retire_version(existing)
 
@@ -129,7 +158,7 @@ class IngestionPipeline:
         doc = await self._repo.get_document(doc_id)
         if not doc:
             return False
-        self._store.delete_document_chunks(doc_id)
+        await self._store.delete_document_chunks(doc_id)
         await self._repo.delete_document(doc_id)
         logger.info("Deleted document %s (%s)", doc_id, doc.filename)
         return True
@@ -151,11 +180,11 @@ class IngestionPipeline:
     async def _process(self, doc_id: str, filename: str, parsed) -> str:
         await self._repo.set_status(doc_id, "processing")
         try:
-            # ── Path 1: Docling HybridChunker ────────────────────────
+            # Path 1: Docling HybridChunker
             if parsed.parser_used == "docling" and parsed.metadata.get("docling_doc"):
                 return await self._process_docling(doc_id, filename, parsed)
 
-            # ── Path 2: layout-aware TextChunk chunker ────────────────
+            # Path 2: layout-aware TextChunk chunker
             chunks = chunk_document(
                 parsed.elements,
                 chunk_size=self._rsettings.chunk_size,
@@ -177,19 +206,20 @@ class IngestionPipeline:
         Chunk with Docling's HybridChunker then embed and store.
 
         HybridChunker produces DocChunk objects with:
-          .text      — the chunk text
-          .meta      — DocMeta with headings, page refs, doc origin
+          .text -- the chunk text
+          .meta -- DocMeta with headings, page refs, doc origin
         """
         from backend.ingestion.parsers.docling_parser import chunk_with_hybrid_chunker
 
         try:
-            doc_chunks = chunk_with_hybrid_chunker(
+            doc_chunks = await asyncio.to_thread(
+                chunk_with_hybrid_chunker,
                 parsed,
                 embed_model_name=self._rsettings.embed_model,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "HybridChunker failed for %s (%s) — falling back to layout chunker.",
+                "HybridChunker failed for %s (%s) -- falling back to layout chunker.",
                 filename, exc,
             )
             text_chunks = chunk_document(parsed.elements,
@@ -197,18 +227,16 @@ class IngestionPipeline:
                                          chunk_overlap=self._rsettings.chunk_overlap)
             return await self._embed_and_store(doc_id, filename, text_chunks)
 
-        # Convert DocChunk → TextChunk for the shared embed/store path
+        # Convert DocChunk -> TextChunk for the shared embed/store path
         text_chunks: list[TextChunk] = []
         for idx, dc in enumerate(doc_chunks):
             heading = ""
             page    = 0
             meta    = getattr(dc, "meta", None)
             if meta:
-                # DocMeta exposes headings as a list of strings
                 headings = getattr(meta, "headings", None) or []
                 if headings:
-                    heading = " › ".join(str(h) for h in headings)
-                # Page reference
+                    heading = " / ".join(str(h) for h in headings)
                 doc_items = getattr(meta, "doc_items", None) or []
                 for di in doc_items:
                     prov = getattr(di, "prov", None) or []
@@ -263,8 +291,11 @@ class IngestionPipeline:
             await self._repo.set_status(doc_id, "failed")
             return doc_id
 
-        texts   = [c.content for c in chunks]
-        vectors = self._embedder.encode(texts)
+        texts = [c.content for c in chunks]
+        # [FIX-ASYNC2] encode() is synchronous/CPU-bound. The Embedder class
+        # already exposes encode_async() for this; this call site just
+        # hadn't been switched over to it yet.
+        vectors = await self._embedder.encode_async(texts)
 
         # Semantic deduplication
         if self._isettings.dedup_threshold > 0.0:
@@ -286,7 +317,10 @@ class IngestionPipeline:
             }
             for c in chunks
         ]
-        wids = self._store.upsert_chunks(props, vectors)
+        # [FIX-AWAIT] Was missing await. wids would have been an unawaited
+        # coroutine, and zip(chunks, wids) below would raise TypeError the
+        # first time this path was hit.
+        wids = await self._store.upsert_chunks(props, vectors)
         for chunk, wid in zip(chunks, wids):
             await self._repo.add_chunk(
                 document_id=doc_id,
@@ -295,11 +329,15 @@ class IngestionPipeline:
                 heading=chunk.heading,
                 page=chunk.page,
                 element_type=chunk.element_type,
-                weaviate_id=wid,
+                weaviate_id=wid,   # column name kept as-is; renaming risks
+                                   # breaking existing SQLite databases for
+                                   # zero functional benefit -- this is just
+                                   # the vector store point ID, whichever
+                                   # store is in use.
             )
 
         await self._repo.set_chunk_count(doc_id, len(chunks))
-        logger.info("Ingested %s → %d chunks", filename, len(chunks))
+        logger.info("Ingested %s -> %d chunks", filename, len(chunks))
         return doc_id
 
     async def _retire_version(self, doc) -> None:
@@ -313,7 +351,9 @@ class IngestionPipeline:
             (uuid.uuid4().hex, doc.id, doc.version, doc.filename,
              doc.content_hash, doc.chunk_count),
         )
-        self._store.delete_document_chunks(doc.id)
+        # [FIX-AWAIT] Was missing await -- silently no-op'd, old chunks
+        # never actually got deleted from the vector store on re-ingest.
+        await self._store.delete_document_chunks(doc.id)
         await self._repo.delete_chunks(doc.id)
         logger.info("Retired v%d of document %s (%s)", doc.version, doc.id, doc.filename)
 
@@ -334,8 +374,8 @@ def _deduplicate(
     vectors: list[list[float]],
     threshold: float,
 ) -> tuple[list[TextChunk], list[list[float]]]:
-    kept_c: list[TextChunk]       = []
-    kept_v: list[list[float]]     = []
+    kept_c: list[TextChunk]   = []
+    kept_v: list[list[float]] = []
     for chunk, vec in zip(chunks, vectors):
         if not any(_cosine(vec, kv) >= threshold for kv in kept_v):
             kept_c.append(chunk)

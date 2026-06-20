@@ -1,14 +1,12 @@
 """
 backend/retrieval/engine.py
 ============================
-Retrieval pipeline: embed → hybrid_search → rerank → format_context.
+Retrieval pipeline: embed -> hybrid_search -> rerank -> format_context.
 
-Fix applied: retrieve() is now async. Previously it called the synchronous
-embedder.encode_one() and the synchronous store.hybrid_search() directly
-on the event loop, stalling all FastAPI coroutines during every retrieval.
-
-Both inner calls are now properly awaited (store.hybrid_search is now async
-in weaviate_store.py) and encode_one is wrapped in asyncio.to_thread().
+store is typed as QdrantStore. weaviate_store.py no longer exists as an
+importable module (weaviate-client was removed from pyproject.toml during
+the migration), so this import is load-bearing -- this exact line is what
+was crashing on startup.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ import logging
 
 from backend.retrieval.embedder import Embedder
 from backend.retrieval.reranker import Reranker, RankedResult
-from backend.retrieval.weaviate_store import WeaviateStore, SearchHit
+from backend.retrieval.qdrant_store import QdrantStore, SearchHit
 from backend.shared.config import RetrievalSettings
 
 logger = logging.getLogger(__name__)
@@ -27,7 +25,7 @@ logger = logging.getLogger(__name__)
 class RetrievalEngine:
     def __init__(
         self,
-        store: WeaviateStore,
+        store: QdrantStore,
         embedder: Embedder,
         reranker: Reranker,
         settings: RetrievalSettings,
@@ -43,16 +41,13 @@ class RetrievalEngine:
         alpha_override: float | None = None,
     ) -> list[RankedResult]:
         """
-        Run the full embed → search → rerank pipeline.
-
-        Now fully async: embedding runs in a thread pool worker,
-        Weaviate search is awaited (async in weaviate_store.py).
+        Full embed -> search -> rerank pipeline. Fully async:
+        encode_one runs in a thread pool, hybrid_search is awaited on
+        QdrantStore's native AsyncQdrantClient, reranker runs in a thread pool.
         """
         if not query.strip():
             return []
 
-        # Encode on thread pool — bge-m3 is CPU/GPU bound, not I/O bound,
-        # but moving it off the event loop lets other coroutines run concurrently.
         vector: list[float] = await asyncio.to_thread(self._embedder.encode_one, query)
 
         alpha = alpha_override if alpha_override is not None else self._settings.hybrid_alpha
@@ -62,7 +57,7 @@ class RetrievalEngine:
             top_k=self._settings.top_k,
             alpha=alpha,
         )
-        logger.debug("Hybrid search returned %d candidates.", len(hits))
+        logger.debug("Qdrant search returned %d candidates.", len(hits))
 
         if not hits:
             return []
@@ -80,7 +75,6 @@ class RetrievalEngine:
             for h in hits
         ]
 
-        # Reranker is CPU/GPU bound — run in thread pool
         ranked: list[RankedResult] = await asyncio.to_thread(
             self._reranker.rerank,
             query,
@@ -100,7 +94,7 @@ class RetrievalEngine:
             page    = r.metadata.get("page", "")
             header  = f"[{i}] {source}"
             if heading:
-                header += f" — {heading}"
+                header += f" - {heading}"
             if page:
                 header += f" (p.{page})"
             parts.append(f"{header}\n{r.content}")

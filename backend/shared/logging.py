@@ -56,3 +56,19 @@ def setup_logging(level: str = "INFO", fmt: str = "rich") -> None:
     # Silence noisy third-party loggers
     for noisy in ("httpx", "httpcore", "openai", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # [FIX] huggingface_hub emits the "unauthenticated requests" warning via
+    # TWO independent paths for the same condition: a direct warnings.warn()
+    # (prints raw to stderr, no prefix -- not something this logger config
+    # can touch, since it bypasses the logging module entirely) AND its own
+    # internal logger.warning() call (the second, [HH:MM:SS]-prefixed copy
+    # seen in the terminal). Setting this logger's level to ERROR removes
+    # the second copy, leaving one instead of two.
+    #
+    # The actual root-cause fix -- as the warning itself states -- is
+    # providing a real HF_TOKEN (a free, anonymous "read" token is enough;
+    # bge-m3 and bge-reranker-large are public models, no paid access
+    # needed). That removes the underlying condition entirely rather than
+    # just quieting one of its two output paths. Add HF_TOKEN=hf_... to
+    # .env if you want it gone outright rather than just deduplicated.
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)

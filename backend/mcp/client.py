@@ -1,0 +1,169 @@
+"""
+backend/mcp/client.py
+======================
+Async MCP client bridge connecting ReActGraph (and any other caller) to
+the FastMCP server mounted at /mcp inside the same FastAPI process.
+
+Responsibilities:
+  1. Discover tools via session.list_tools(), convert to OpenAI function-
+     calling format for ChatOllama's bind_tools().
+  2. call_tool(name, args) -- dispatch a single tool call.
+  3. Cache schemas so repeated ReActGraph.run() calls don't re-fetch
+     every time; force_refresh=True bypasses the cache (used by the
+     list_available_tools self-discovery tool).
+
+Transport: streamable HTTP (requires mcp>=1.1.0). Falls back to SSE for
+mcp==1.0.x automatically.
+
+[FIX] _DEFAULT_MCP_URL now ends in a trailing slash ("/mcp/" not "/mcp").
+Confirmed against an official modelcontextprotocol/python-sdk GitHub issue
+(#1168) describing exactly this symptom: FastMCP's streamable_http_app()
+mounts on a Starlette Router with redirect_slashes=True by default, so a
+POST to the bare mount path ("/mcp") gets a 307 redirect to "/mcp/" before
+the real request is even handled. That roundtrip is exactly what was
+showing up as two separate POSTs in the log (one to /mcp, one to /mcp/)
+immediately before the "unhandled errors in a TaskGroup" failure --
+several related SDK issues report the client's session/task-group setup
+getting confused by the redirect hop itself. Requesting the trailing-slash
+URL directly avoids the redirect entirely rather than trying to make the
+client handle it gracefully.
+"""
+
+import asyncio
+import logging
+from typing import Any, AsyncIterator
+from contextlib import asynccontextmanager
+
+logger = logging.getLogger(__name__)
+
+# Trailing slash is required -- see module docstring [FIX] note above.
+_DEFAULT_MCP_URL = "http://localhost:8000/mcp/"
+
+_schema_cache: list[dict] | None = None
+_cache_lock = asyncio.Lock()
+
+
+def _log_unwrapped(context: str, exc: BaseException, _depth: int = 0) -> None:
+    """
+    Log the real cause of a failure, not just a generic wrapper message.
+
+    asyncio.TaskGroup (used internally by mcp's streamablehttp_client for
+    managing concurrent read/write streams) raises an ExceptionGroup on
+    failure. Its default str() is just "unhandled errors in a TaskGroup
+    (N sub-exception)" -- it says nothing about what actually went wrong.
+
+    [FIX] This used to only unwrap ONE level. In practice the MCP SDK
+    nests TaskGroups (one for the overall client session, another inside
+    it for the read/write stream pump), so the "sub-exception" found at
+    depth 1 was often itself ANOTHER ExceptionGroup, which just printed
+    the same generic wrapper text one level down -- no more informative
+    than not unwrapping at all. This now recurses until it reaches actual
+    leaf exceptions, and prints a full traceback for each leaf (not just
+    type+message), since at this nesting depth the leaf is often several
+    frames away from anything obviously related to the original call.
+    """
+    import traceback
+
+    indent = "  " * _depth
+    if isinstance(exc, BaseExceptionGroup):
+        logger.error("%s%s: %s (%d sub-exception(s))",
+                     indent, context, type(exc).__name__, len(exc.exceptions))
+        for i, sub in enumerate(exc.exceptions, start=1):
+            _log_unwrapped(f"{context} -> [{i}/{len(exc.exceptions)}]", sub, _depth + 1)
+    else:
+        logger.error("%s%s: %s: %s", indent, context, type(exc).__name__, exc)
+        tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        for line in "".join(tb_lines).splitlines():
+            logger.error("%s    %s", indent, line)
+
+
+def invalidate_schema_cache() -> None:
+    global _schema_cache
+    _schema_cache = None
+
+
+def _mcp_tool_to_openai(tool: Any) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name":        tool.name,
+            "description": tool.description or "",
+            "parameters":  tool.inputSchema,
+        },
+    }
+
+
+@asynccontextmanager
+async def _get_session(mcp_url: str) -> AsyncIterator[Any]:
+    from mcp import ClientSession
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+        async with streamablehttp_client(mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+    except ImportError:
+        from mcp.client.sse import sse_client  # type: ignore[import]
+        async with sse_client(mcp_url) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+
+async def get_tool_schemas(
+    mcp_url: str = _DEFAULT_MCP_URL,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Fetch and cache all tool schemas from the MCP server in OpenAI format."""
+    global _schema_cache
+    async with _cache_lock:
+        if _schema_cache is not None and not force_refresh:
+            return _schema_cache
+        try:
+            async with _get_session(mcp_url) as session:
+                result  = await session.list_tools()
+                schemas = [_mcp_tool_to_openai(t) for t in result.tools]
+            _schema_cache = schemas
+            logger.info("MCP client: discovered %d tools: %s",
+                        len(schemas), [s["function"]["name"] for s in schemas])
+            return schemas
+        except Exception as exc:
+            logger.error("Failed to fetch MCP tool schemas from %s -- using cached/empty fallback", mcp_url)
+            _log_unwrapped("MCP schema fetch failure", exc)
+            return _schema_cache or []
+
+
+async def call_tool(
+    name: str,
+    arguments: dict[str, Any],
+    mcp_url: str = _DEFAULT_MCP_URL,
+) -> str:
+    """
+    Call a named MCP tool and return its text output.
+
+    Returns an error string prefixed with "[MCP ERROR]" on failure rather
+    than raising, so the calling graph node can surface it to the LLM as
+    a tool result instead of crashing the whole run.
+    """
+    from backend.tools.schemas import validate_tool_args
+    try:
+        arguments = validate_tool_args(name, arguments)
+    except Exception as exc:
+        return f"[MCP ERROR] Argument validation failed for '{name}': {exc}"
+
+    try:
+        async with _get_session(mcp_url) as session:
+            result = await session.call_tool(name, arguments)
+            texts = [
+                block.text for block in result.content
+                if hasattr(block, "text") and block.text
+            ]
+            return "\n".join(texts) if texts else "(tool returned no output)"
+    except Exception as exc:
+        _log_unwrapped(f"MCP tool call '{name}' failed", exc)
+        return f"[MCP ERROR] {name}: {exc}"
+
+
+async def list_tool_names(mcp_url: str = _DEFAULT_MCP_URL) -> list[str]:
+    schemas = await get_tool_schemas(mcp_url=mcp_url)
+    return [s["function"]["name"] for s in schemas]

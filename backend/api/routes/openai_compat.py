@@ -263,10 +263,16 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
     # Build URL directly to llama.cpp — bypass our LLMProvider wrapper since
     # we need the raw response to extract tool_calls
     llama_url = settings.llm.base_url.rstrip("/") + "/chat/completions"
-    headers   = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings.llm.api_key}",
-    }
+
+    # [FIX] Previously always sent Authorization: Bearer {settings.llm.api_key},
+    # which becomes the literal string "Bearer None" when no key is configured
+    # (the common case for a local Ollama setup -- Ollama doesn't require one).
+    # Harmless against Ollama in practice (it ignores Authorization entirely),
+    # but a real bug waiting to surface against any backend that actually
+    # checks the header. Only send it if a real key is configured.
+    headers = {"Content-Type": "application/json"}
+    if settings.llm.api_key:
+        headers["Authorization"] = f"Bearer {settings.llm.api_key}"
 
     # ── Streaming ─────────────────────────────────────────────────────────
     if body.stream:
@@ -280,7 +286,22 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
                 )) as client:
                     async with client.stream("POST", llama_url,
                                              json=payload, headers=headers) as resp:
-                        resp.raise_for_status()
+                        # [FIX] raise_for_status()'s default exception string
+                        # is just "Client error '404 Not Found' for url
+                        # '...'" -- it does not include the response body.
+                        # For a streaming response the body is exactly what
+                        # tells us WHY the backend rejected the request (e.g.
+                        # an Ollama/llama.cpp error explaining the model
+                        # doesn't support the requested feature). Read and
+                        # log it explicitly before raising, since
+                        # raise_for_status() consumes the response state.
+                        if resp.is_error:
+                            error_body = await resp.aread()
+                            logger.error(
+                                "openai_compat stream error: backend returned %d for %s -- body: %s",
+                                resp.status_code, llama_url, error_body.decode(errors="replace")[:1000],
+                            )
+                            resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             if line.startswith("data: "):
                                 data_str = line[6:].strip()
@@ -291,6 +312,11 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
                                 # already formats them as OpenAI stream chunks
                                 # including tool_call deltas
                                 yield f"data: {data_str}\n\n"
+            except httpx.HTTPStatusError as exc:
+                # Body and status already logged with full detail above,
+                # right before raise_for_status() raised this. Don't log
+                # the same failure twice with less detail the second time.
+                yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
             except Exception as exc:  # noqa: BLE001
                 logger.error("openai_compat stream error: %s", exc)
                 yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
@@ -314,11 +340,23 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
             write=30.0, pool=5.0
         )) as client:
             resp = await client.post(llama_url, json=payload, headers=headers)
+            # [FIX] Same reasoning as the streaming path above -- capture the
+            # actual response body before raise_for_status() raises, since
+            # the exception's default string form discards it entirely.
+            if resp.is_error:
+                logger.error(
+                    "openai_compat HTTP error: backend returned %d for %s -- body: %s",
+                    resp.status_code, llama_url, resp.text[:1000],
+                )
             resp.raise_for_status()
             llama_resp = resp.json()
     except httpx.HTTPStatusError as exc:
         logger.error("openai_compat HTTP error: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # Surface the backend's actual error body to the caller (Terax) too,
+        # not just the bare status line -- this is the detail that actually
+        # explains *why* the request was rejected.
+        detail = exc.response.text[:500] if exc.response is not None else str(exc)
+        raise HTTPException(status_code=502, detail=detail) from exc
     except Exception as exc:  # noqa: BLE001
         logger.error("openai_compat error: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc

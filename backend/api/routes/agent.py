@@ -4,7 +4,8 @@ backend/api/routes/agent.py
 Agentic feature endpoints.
 
 POST /api/agent/iterate       — autonomous iteration (generate → evaluate → reflect loop)
-POST /api/agent/tools/execute — self-healing tool calling pipeline
+POST /api/agent/tools/execute — self-healing tool calling pipeline (legacy, JSON-text parsing)
+POST /api/agent/react         — ReAct loop with native function calling (MCP-backed, Phase 1 litmus test)
 """
 
 from __future__ import annotations
@@ -51,6 +52,15 @@ class ToolExecuteResponse(BaseModel):
     iterations: int
     reflections: list[str]
     results: list[dict]
+
+
+class ReactRequest(BaseModel):
+    message: str
+    max_rounds: int = 10
+
+
+class ReactResponse(BaseModel):
+    response: str
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +121,11 @@ async def execute_tools(
     body: ToolExecuteRequest, request: Request
 ) -> ToolExecuteResponse:
     """
-    Run the self-healing tool calling pipeline.
+    Run the self-healing tool calling pipeline (legacy).
 
-    The LLM plans tool calls, executes them, evaluates results,
-    and retries with corrections on failure — up to max_retries times.
-
-    Available tools are passed by name. Only registered tools can be invoked.
+    Superseded by /agent/react for new development -- this endpoint uses
+    the older JSON-text-parsing tool selection pattern. Kept for now since
+    nothing has migrated off it yet.
     """
     from backend.agent.tool_graph import SelfHealingToolGraph
     from backend.tools.registry import get_registered_tools
@@ -154,3 +163,45 @@ async def execute_tools(
             for r in result["tool_results"]
         ],
     )
+
+
+@router.post("/agent/react", response_model=ReactResponse)
+async def react(body: ReactRequest, request: Request) -> ReactResponse:
+    """
+    Run the ReAct tool-calling loop (Phase 1 litmus test).
+
+    Uses ChatOllama (langchain-ollama) native function calling against
+    Ollama, MCP-discovered tools (qdrant_search, qdrant_ingest, web_search,
+    execute_code, check_services, qdrant_snapshot, list_available_tools),
+    and the orchestration guardrails (call memoization + circuit breaker).
+
+    With Logfire configured (local-only, no account needed), every round
+    of this loop -- the prompt sent, the raw completion, every tool call
+    and its latency, and any guardrail trips -- is visible in the trace.
+    This is the endpoint to hit to verify the loop end-to-end.
+
+    Example:
+        curl -X POST http://localhost:8000/api/agent/react \\
+             -H "Content-Type: application/json" \\
+             -d '{"message": "What tools do you have available?"}'
+    """
+    from backend.agent.react_graph import ReActGraph
+
+    chat_ollama = getattr(request.app.state, "chat_ollama", None)
+    if chat_ollama is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ChatOllama not initialised. Check app startup logs.",
+        )
+
+    graph = ReActGraph(llm=chat_ollama, max_rounds=min(body.max_rounds, 15))
+    response_text = await graph.run(user_message=body.message)
+
+    if not response_text:
+        raise HTTPException(
+            status_code=502,
+            detail="ReAct loop completed with no final text response. "
+                   "Check logs/logfire trace for what happened in each round.",
+        )
+
+    return ReactResponse(response=response_text)
