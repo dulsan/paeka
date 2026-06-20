@@ -10,6 +10,12 @@ The project is designed for users who want a private, extensible AI assistant ca
 
 ---
 
+## ⚠️ Status: Unstable & Experimental
+
+**PAEKA is currently in active development and should be used with caution.** The system is undergoing significant architectural changes, and breaking changes may occur without notice. Use in production environments at your own risk. Features are subject to change, and data loss or unexpected behavior may occur.
+
+---
+
 ## Features
 
 ### Local-First AI Assistant
@@ -346,31 +352,49 @@ uv sync --extra dev
 
 ---
 
-## 3. Start Weaviate
+## 3. Start Qdrant Vector Store
 
 ```bash
-docker compose up -d
+# Download qdrant.exe from:
+# https://github.com/qdrant/qdrant/releases
+# Look for: qdrant-x86_64-pc-windows-msvc.zip
+
+# Run in a terminal:
+.\bin\qdrant.exe
+
 # Verify:
-curl http://localhost:8090/v1/.well-known/ready
+curl http://localhost:6333/healthz
 ```
+
 ---
 
-## 4. Download a Model
+## 4. Start Ollama (LLM Backend)
 
 ```bash
-# Example:
-uv run python scripts/download_model.py
+# Download from: https://ollama.ai
+# Then start the service:
+ollama serve
 ```
 
-Place GGUF models under:
+In another terminal, create the model:
 
-```text
-models/
+```bash
+ollama create paeka-qwen -f models\qwen\Modelfile
+```
+
+Verify:
+
+```bash
+curl http://localhost:11434/v1/models
 ```
 
 ---
 
-## 5. Configure
+
+
+---
+
+## 5. Configure (Optional)
 
 Edit:
 
@@ -382,7 +406,9 @@ Important sections:
 
 ```toml
 [llm]
-base_url = "http://localhost:8080/v1"
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "paeka-qwen"
 
 [retrieval]
 enabled = true
@@ -390,27 +416,42 @@ enabled = true
 [memory]
 enabled = true
 
-[knowledge_graph]
-enabled = true
+[tools]
+web_search_enabled = false  # Set true to enable with SearXNG
+
+[sandbox]
+enabled = true  # Requires Docker Desktop
 ```
 
 ---
 
 ## 6. Start PAEKA
 
-Windows:
+Windows (PowerShell):
 
 ```powershell
-pwsh .\scripts\start.ps1
-# or use the "fixed" version (still has problems that needs to be resolved. NOTE: OneDrive usage does effect this program significantly)
-pwsh .\scripts\start_fixed.ps1
+cd "C:\path\to\paeka"
+uv sync
+uv run python main.py
 ```
 
-Manual:
+**Note:** OneDrive integration can cause synchronization issues. If you experience problems, ensure the paeka directory is excluded from OneDrive sync.
+
+Manual with uv:
 
 ```bash
-uv run uvicorn main:app --host 0.0.0.0 --port 8000
+uv run python main.py
 ```
+
+Or direct uvicorn:
+
+```bash
+uv run uvicorn backend.api.app:create_app --host 0.0.0.0 --port 8000 --factory
+```
+
+The application will be available at: `http://localhost:8000`
+
+API documentation: `http://localhost:8000/docs` (if enabled in settings)
 
 ---
 
@@ -466,15 +507,38 @@ uv run pyright
 
 # Roadmap
 
-Planned and partially implemented capabilities include:
+PAEKA development follows a phased approach focused on defensive, observable development with measurable stability milestones.
 
-* Enhanced multi-agent orchestration
-* Improved tool execution
-* Expanded knowledge graph reasoning
-* SearXNG integration
-* MCP integrations
-* Advanced workflow automation
-* Fix database design and model server (more locally hostable friendly, and easier to scale into different tech stacks)
+## Phase 1: Establish Observability & Safety Rails (Current)
+
+The goal: **"Never debug blind."** Build diagnostic frameworks and execution guardrails so every failure produces a clean signal.
+
+- **Local Logfire Tracing:** Structured tracing of LLM prompts, completions, tool calls, and latency across LangGraph, langchain-ollama, and HTTPX.
+- **Orchestration Guardrails:** Call-memoization and circuit-breaker logic to prevent tool looping and consecutive failures. Failures are logged as deliberate events in the trace.
+- **ReAct Loop Validation:** End-to-end tool calling with native LLM function calling (langchain-ollama ChatOllama) to verify schema translation and MCP tool dispatch.
+- **MCP Tool Discovery:** In-process tool manager fallback to avoid transport round-trips during initialization. (✅ Completed)
+
+## Phase 2: Core Parity & State Verification
+
+With a visible, stable loop, wire up missing data layers confidently.
+
+- **GraphRAG via MCP:** Build the `graph_search` tool for entity-relation queries.
+- **Conversation Memory on Qdrant:** Validate history summarization and semantic retrieval against the vector store.
+- **Tool Call Tracing:** Deep visibility into which tools are called, their arguments, and results in the trace.
+
+## Phase 3: Environment Polish (Pre-Docker Stabilization)
+
+Use hard-learned lessons to build a defensive local environment.
+
+- **Interactive Pre-Flight Wizard:** Diagnostics for OneDrive blocks, port conflicts, unsigned binaries, and environment validation.
+- **Second-Round Stabilization Testing:** End-to-end system verification using the wizard to simulate a clean install.
+- **Windows Integration Hardening:** Resolve OneDrive synchronization issues and file lock interactions.
+
+## Phase 4: Dockerization & Advanced Features
+
+- **Containerization:** Transition to `docker-compose` for reproducible, isolated deployments. Self-hosted Langfuse integration.
+- **Advanced Architecture:** Hardened code sandboxes, long-context graph compression, CPU-bound router model testing.
+- **Production Hardening:** Structured error handling, graceful degradation, and comprehensive observability.
 
 ---
 
