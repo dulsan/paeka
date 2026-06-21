@@ -71,7 +71,8 @@ async def execute_code(
             detail="Docker is not available. Ensure Docker is running on the host.",
         )
 
-    settings = get_settings()
+    # [FIX] settings was fetched and never used -- max_timeout below is a
+    # hardcoded constant, not read from settings. Dead code.
     max_timeout = 60   # hard cap regardless of user request
     timeout = min(body.timeout or 30, max_timeout)
 

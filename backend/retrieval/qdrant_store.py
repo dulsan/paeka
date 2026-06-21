@@ -96,12 +96,22 @@ class QdrantStore:
         has no effect on that failure mode; it only silences the separate
         version-check warning that can fire on its own schedule.
         """
-        self._client = AsyncQdrantClient(url=self._url, check_compatibility=False)
+        # [FIX] Use a local variable for the calls below, not self._client
+        # directly. pyright doesn't carry narrowing forward across
+        # statements for instance attributes the way it does for local
+        # variables (a deliberate, standard type-checker conservatism --
+        # nothing here is actually unsafe at runtime since this is
+        # sequential code, but pyright can't prove that statically for
+        # `self._client`). This is the same reason _require_client()
+        # exists and is used at every other call site in this file below;
+        # connect() just hadn't been brought in line with that pattern.
+        client = AsyncQdrantClient(url=self._url, check_compatibility=False)
+        self._client = client
 
-        exists = await self._client.collection_exists(_COLLECTION)
+        exists = await client.collection_exists(_COLLECTION)
         if not exists:
             logger.info("Creating Qdrant collection '%s' (dim=%d)", _COLLECTION, self._vector_dim)
-            await self._client.create_collection(
+            await client.create_collection(
                 collection_name=_COLLECTION,
                 vectors_config=VectorParams(
                     size=self._vector_dim,
@@ -109,7 +119,7 @@ class QdrantStore:
                 ),
             )
             # Index key payload fields for fast filter-based deletes
-            await self._client.create_payload_index(
+            await client.create_payload_index(
                 collection_name=_COLLECTION,
                 field_name="document_id",
                 field_schema="keyword",
@@ -164,7 +174,7 @@ class QdrantStore:
         point_ids: list[str] = []
         points: list[PointStruct] = []
 
-        for props, vec in zip(chunks, vectors):
+        for props, vec in zip(chunks, vectors, strict=True):
             pid = str(_uuid.uuid4())
             points.append(PointStruct(id=pid, vector=vec, payload=props))
             point_ids.append(pid)

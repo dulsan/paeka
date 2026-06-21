@@ -29,6 +29,7 @@ async def client():
             AppSettings, ServerSettings, LLMSettings, DatabaseSettings,
             MemorySettings, RetrievalSettings, IngestionSettings,
             KnowledgeGraphSettings, SkillsSettings, ToolsSettings, LoggingSettings,
+            SecuritySettings, DeploymentSettings,
         )
         settings = MagicMock()
         settings.app = AppSettings()
@@ -42,6 +43,27 @@ async def client():
         settings.skills = SkillsSettings(enabled=False)
         settings.tools = ToolsSettings()
         settings.logging = LoggingSettings()
+        # [FIX] These two were missing entirely. settings is a bare
+        # MagicMock(), so any attribute NOT explicitly assigned here --
+        # like settings.security -- auto-generates its own fresh MagicMock
+        # on access instead of raising. That meant settings.security.
+        # default_rpm (read by RateLimitMiddleware on every single request)
+        # was silently a MagicMock instead of a real int, and `rpm / 60.0`
+        # then `min(float(rpm), bucket.tokens + ...)` blew up with
+        # "'<' not supported between instances of 'MagicMock' and 'float'"
+        # -- on literally every request, which is why all 9 tests in this
+        # file failed identically. SecuritySettings() defaults to
+        # rate_limit_enabled=False already, so just instantiating it for
+        # real (instead of leaving it as an auto-mock) is enough to fix
+        # this -- explicit here for clarity since middleware behaviour
+        # shouldn't depend on silently-unconfigured mock defaults.
+        # settings.deploy was also missing -- create_app() reads
+        # settings.deploy.mode for CORS origin selection; an unconfigured
+        # MagicMock there wouldn't crash (mode == "development" just
+        # evaluates False against a MagicMock) but would silently produce
+        # a nonsense CORS origin string rather than the intended behaviour.
+        settings.security = SecuritySettings(rate_limit_enabled=False)
+        settings.deploy = DeploymentSettings()
         mock_settings.return_value = settings
 
         from backend.api.app import create_app
@@ -53,6 +75,14 @@ async def client():
 
         mock_llm = MagicMock()
         mock_llm.health_check = AsyncMock(return_value=True)
+        # [FIX] Same MagicMock gotcha as settings.security above, different
+        # spot: health.py does getattr(llm, "provider_name", <default>).
+        # On a bare MagicMock(), accessing .provider_name doesn't raise
+        # AttributeError -- it auto-generates a fresh MagicMock as the
+        # value, so the attribute access *succeeds* and getattr's default
+        # is never used at all. Pydantic's ComponentStatus model then
+        # rejects that MagicMock when validating llm_provider as a string.
+        mock_llm.provider_name = "ollama"
 
         async def fake_stream(messages, **_):
             for word in ["Hello", " world", "!"]:

@@ -167,14 +167,40 @@ explicit = true
 # -- Linting & type checking -----------------------------------------------
 [tool.ruff]
 line-length    = 100
-target-version = "py312"
+# [FIX] Was "py312" -- the project actually runs on Python 3.14 throughout
+# this codebase (confirmed via every traceback path seen in development:
+# .../AppData/Local/Python/pythoncore-3.14-64/...). Affects which syntax
+# modernization suggestions ruff's UP-series rules make.
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
+# [FIX] B008 (function-call-in-default-argument) doesn't know about
+# FastAPI's special parameter-marker classes (File, Depends, Query, Body,
+# Path, Header, Cookie, Form) -- these are NOT ordinary function calls
+# whose result gets reused across requests; FastAPI's own dependency-
+# injection system recognises and replaces them per-request. Without this,
+# ruff flags every `file: UploadFile = File(...)` as if it were the
+# genuine mutable-default-argument bug class B008 exists to catch.
+# Confirmed against ruff's own documentation as the sanctioned fix for
+# this exact, well-known FastAPI false positive.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.params.Depends",
+    "fastapi.Query", "fastapi.params.Query",
+    "fastapi.Body", "fastapi.params.Body",
+    "fastapi.Path", "fastapi.params.Path",
+    "fastapi.Header", "fastapi.params.Header",
+    "fastapi.Cookie", "fastapi.params.Cookie",
+    "fastapi.Form", "fastapi.params.Form",
+    "fastapi.File", "fastapi.params.File",
+]
+
 [tool.pyright]
-pythonVersion    = "3.12"
+# [FIX] Same version mismatch as ruff's target-version above.
+pythonVersion    = "3.14"
 typeCheckingMode = "standard"
 venvPath         = "."
 venv             = ".venv"

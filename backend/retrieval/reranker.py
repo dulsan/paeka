@@ -77,7 +77,7 @@ class Reranker:
         scores: list[float] = self._reranker.compute_score(pairs, normalize=True)
 
         ranked = sorted(
-            zip(scores, passages),
+            zip(scores, passages, strict=True),
             key=lambda x: x[0],
             reverse=True,
         )

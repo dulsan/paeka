@@ -146,11 +146,19 @@ class Database:
 
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self._path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute("PRAGMA foreign_keys=ON")
-        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        # [FIX] Use a local variable for the calls below, not self._conn
+        # directly -- same reasoning as backend/retrieval/qdrant_store.py's
+        # connect() fix. pyright doesn't narrow instance attributes across
+        # statements the way it does local variables; this file already
+        # uses the correct pattern elsewhere (the assert at line ~170 and
+        # the _require-style helper just below close()), connect() just
+        # hadn't been brought in line with it.
+        conn = await aiosqlite.connect(self._path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn = conn
         await self._migrate()
         logger.info("SQLite connected: %s", self._path)
 

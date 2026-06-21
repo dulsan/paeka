@@ -256,7 +256,11 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
                 detail=f"Message blocked: {scan.findings[0]}",
             )
 
-    model_id      = body.model or settings.llm.model or "paeka-model"
+    # [FIX] model_id was assigned here and never read anywhere -- confirmed
+    # _build_payload() independently recomputes the identical expression
+    # for payload["model"], and the response's model field is passed
+    # through from Ollama's own response, not derived from this variable.
+    # Genuinely dead code, not a functional gap.
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created_ts    = int(time.time())
 

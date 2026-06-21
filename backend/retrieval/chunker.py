@@ -46,10 +46,20 @@ BGE_M3_MAX_TOKENS = 512
 class TextChunk:
     content: str
     chunk_index: int
-    heading: str     = ""
-    start_char: int  = 0
-    end_char: int    = 0
-    metadata: dict   = field(default_factory=dict)
+    heading: str       = ""
+    start_char: int    = 0
+    end_char: int      = 0
+    # [FIX] Added as real top-level fields. backend/ingestion/pipeline.py's
+    # _process_docling() constructs TextChunk(..., page=page,
+    # element_type="text") -- that call has been raising
+    # "TypeError: unexpected keyword argument 'page'" the instant any
+    # Docling-parsed PDF/DOCX went through that path, since neither field
+    # existed here at all. tests/unit/test_chunker.py also expects
+    # c.element_type as a direct attribute (chunk_document()'s table/code
+    # branch previously only nested it inside metadata).
+    page: int          = 0
+    element_type: str  = "text"
+    metadata: dict     = field(default_factory=dict)
 
     @property
     def content_hash(self) -> str:
@@ -115,7 +125,15 @@ def chunk_document(
         ehead   = getattr(elem, "heading", "") or ""
 
         # Headings: flush current buffer and update section heading
-        if hasattr(etype, "name") and "HEADING" in str(etype):
+        # [FIX] ElementType is a StrEnum (str(ElementType.HEADING) ==
+        # "heading", lowercase) -- this case-sensitive substring check
+        # against uppercase "HEADING" never matched anything, ever.
+        # Heading elements were silently falling through to the regular
+        # text-accumulation path below instead of triggering a section
+        # break, which is why heading text was bleeding into chunk prose
+        # and section headings were tracked incorrectly. Exact,
+        # case-insensitive match instead of substring search.
+        if hasattr(etype, "name") and str(etype).strip().lower() == "heading":
             _flush(buffer)
             buffer  = ""
             heading = content
@@ -126,7 +144,11 @@ def chunk_document(
             heading = ehead
 
         # Tables and code blocks: always emit as their own chunk (atomic)
-        if hasattr(etype, "name") and str(etype) in ("ElementType.TABLE", "ElementType.CODE"):
+        # [FIX] Same StrEnum case mismatch as the heading check above --
+        # str(ElementType.TABLE) is "table", never "ElementType.TABLE".
+        # Tables and code blocks were never being treated as atomic,
+        # despite the docstring's explicit guarantee that they always are.
+        if hasattr(etype, "name") and str(etype).strip().lower() in ("table", "code"):
             _flush(buffer)
             buffer = ""
             prefix = f"{heading}\n\n" if include_headings and heading else ""
@@ -134,6 +156,7 @@ def chunk_document(
                 content=prefix + content,
                 chunk_index=idx,
                 heading=heading,
+                element_type=str(etype).strip().lower(),
                 metadata={"element_type": str(etype)},
             ))
             idx += 1
@@ -157,6 +180,8 @@ def chunk_text(
     text: str,
     chunk_size: int    = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    heading: str       = "",
+    page: int          = 0,
 ) -> list[TextChunk]:
     """
     Split a raw text string into overlapping chunks.
@@ -164,6 +189,14 @@ def chunk_text(
     Splits at sentence boundaries ('. ') when available, otherwise at
     the hard character limit. Used for plain text files, LaTeX source,
     and CSV/spreadsheet exports.
+
+    heading/page: [FIX] previously accepted nowhere on this function at
+    all despite TextChunk having a heading field since this module's
+    first version -- passed through unchanged to every chunk produced,
+    for callers (or tests) that have a single known heading/page for the
+    whole text rather than per-element heading tracking (that's what
+    chunk_document() is for, when you have structured elements instead
+    of a flat string).
     """
     if not text.strip():
         return []
@@ -187,14 +220,35 @@ def chunk_text(
             chunks.append(TextChunk(
                 content=chunk_content,
                 chunk_index=idx,
+                heading=heading,
+                page=page,
                 start_char=start,
                 end_char=end,
             ))
             idx += 1
 
-        start = end - chunk_overlap
-        if start >= len(text):
+        # [FIX] Genuine infinite loop, confirmed reproduced and traced:
+        # when this chunk reaches the end of the text (end == len(text)),
+        # there is no more text left to overlap into a "next" chunk. The
+        # previous code unconditionally computed
+        # `start = end - chunk_overlap` regardless, which whenever the
+        # final chunk's length is <= chunk_overlap (exactly the case
+        # here: a 48-char text with chunk_overlap=10 leaves a final
+        # 10-char tail) produces new_start == start. With zero forward
+        # progress, (start, end) repeats identically forever -- not
+        # "slow", an actual infinite loop. Breaking here once the text is
+        # fully consumed is both the fix and the conceptually correct
+        # behaviour (there's nothing left to chunk).
+        if end >= len(text):
             break
+
+        new_start = end - chunk_overlap
+        # Defensive: guarantee forward progress even in other edge cases
+        # beyond the one just fixed above (e.g. chunk_overlap >=
+        # chunk_size passed by a caller) -- this function should never be
+        # able to hang regardless of input parameters, not just for the
+        # one case that happened to get caught by this test.
+        start = new_start if new_start > start else start + 1
 
     return chunks
 

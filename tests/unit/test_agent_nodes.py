@@ -107,7 +107,11 @@ async def test_retriever_no_engine():
     state = _base_state(sub_queries=[
         SubQuery(query="transformer", tool="vector", priority=1)
     ])
-    result = await retriever_node(state, retrieval_engine=None, graph_retriever=None)
+    # [FIX] retriever_node's actual parameter is named `engine`, not
+    # `retrieval_engine` -- confirmed against backend/agent/nodes/retriever.py's
+    # real signature. This test was written against an older signature and
+    # never updated after the parameter was renamed.
+    result = await retriever_node(state, engine=None, graph_retriever=None)
 
     # hop_count must increment
     assert result["hop_count"] == 1
@@ -128,10 +132,19 @@ async def test_retriever_deduplicates_passages():
         "page": 1,
         "score": 0.9,
         "element_type": "text",
+        "trust_tier": "local",  # [FIX] required field on RetrievalResult, was missing
     }
 
     mock_engine = MagicMock()
-    mock_engine.retrieve = MagicMock(return_value=[
+    # [FIX] RetrievalEngine.retrieve() is genuinely async (confirmed against
+    # backend/retrieval/engine.py -- it's a deliberate async def, with its
+    # own historical [FIX-ASYNC] comment in retriever.py noting it used to
+    # block the event loop before being made async). A plain MagicMock()
+    # here returns the list directly instead of something awaitable, so
+    # `await engine.retrieve(...)` in retriever_node fails with
+    # "object list can't be used in 'await' expression". AsyncMock is the
+    # correct mock type for an async method.
+    mock_engine.retrieve = AsyncMock(return_value=[
         MagicMock(
             content=existing_passage["content"],
             score=0.9,
@@ -144,7 +157,7 @@ async def test_retriever_deduplicates_passages():
         retrieved_passages=[existing_passage],
         hop_count=0,
     )
-    result = await retriever_node(state, retrieval_engine=mock_engine, graph_retriever=None)
+    result = await retriever_node(state, engine=mock_engine, graph_retriever=None)
 
     # Duplicate passage must be filtered out
     assert len(result["retrieved_passages"]) == 1
@@ -164,7 +177,7 @@ async def test_critic_sufficient_passages():
         {
             "content": "The transformer architecture uses multi-head attention.",
             "source": "paper.pdf", "heading": "Abstract",
-            "page": 1, "score": 0.95, "element_type": "text",
+            "page": 1, "score": 0.95, "element_type": "text", "trust_tier": "local",
         }
     ]
 
@@ -193,7 +206,7 @@ async def test_critic_requests_more_retrieval():
         {
             "content": "The transformer uses attention layers.",
             "source": "paper.pdf", "heading": "Intro",
-            "page": 1, "score": 0.7, "element_type": "text",
+            "page": 1, "score": 0.7, "element_type": "text", "trust_tier": "local",
         }
     ]
 
@@ -249,7 +262,7 @@ async def test_synthesiser_produces_answer():
         {
             "content": "Transformers use multi-head self-attention.",
             "source": "paper.pdf", "heading": "Method",
-            "page": 3, "score": 0.95, "element_type": "text",
+            "page": 3, "score": 0.95, "element_type": "text", "trust_tier": "local",
         }
     ]
 

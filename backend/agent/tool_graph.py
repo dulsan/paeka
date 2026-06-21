@@ -448,8 +448,33 @@ async def _tool_synthesiser(s: ToolCallingState, llm: LLMProvider) -> ToolCallin
 # JSON helpers
 # ---------------------------------------------------------------------------
 
+def _strip_json_fence(raw: str) -> str:
+    """
+    Remove a markdown code fence around a JSON payload, if present.
+
+    [FIX] Previously: raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    .lstrip()/.rstrip() with a multi-character argument strip ANY of those
+    *characters* repeatedly from that end, not the literal substring --
+    a well-known Python footgun (flake8-bugbear B005). For "```json" that
+    means stripping any run of backtick/j/s/o/n characters, which happens
+    to produce the right answer for typical well-formed fenced output by
+    coincidence, but isn't actually doing what it looks like it's doing,
+    and can silently consume too much or too little depending on what
+    characters immediately follow the fence. removeprefix()/removesuffix()
+    (Python 3.9+) do exact literal-substring removal -- what was actually
+    intended here.
+    """
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw.removeprefix("```json")
+    elif raw.startswith("```"):
+        raw = raw.removeprefix("```")
+    raw = raw.removesuffix("```")
+    return raw.strip()
+
+
 def _parse_json_list(raw: str) -> list:
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    raw = _strip_json_fence(raw)
     try:
         data = json.loads(raw)
         return data if isinstance(data, list) else []
@@ -458,7 +483,7 @@ def _parse_json_list(raw: str) -> list:
 
 
 def _parse_json_obj(raw: str) -> dict:
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    raw = _strip_json_fence(raw)
     try:
         data = json.loads(raw)
         return data if isinstance(data, dict) else {}

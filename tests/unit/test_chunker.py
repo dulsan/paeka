@@ -55,7 +55,13 @@ def test_chunk_document_atomic_elements():
     table_chunks = [c for c in chunks if c.element_type == "table"]
     # Table must be a single chunk regardless of size
     assert len(table_chunks) == 1
-    assert table_chunks[0].content == big_table
+    # [FIX] include_headings=True (the default) consistently prepends
+    # heading context to every chunk type, tables included -- that's
+    # intentional, the same way regular prose chunks get it, since
+    # knowing which section a table belongs to is valuable context for
+    # retrieval. The test was asserting the bare table content with no
+    # prefix, which never matched real behaviour.
+    assert table_chunks[0].content == f"Section\n\n{big_table}"
 
 
 def test_chunk_document_heading_context():

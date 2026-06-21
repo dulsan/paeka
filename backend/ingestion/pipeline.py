@@ -321,7 +321,7 @@ class IngestionPipeline:
         # coroutine, and zip(chunks, wids) below would raise TypeError the
         # first time this path was hit.
         wids = await self._store.upsert_chunks(props, vectors)
-        for chunk, wid in zip(chunks, wids):
+        for chunk, wid in zip(chunks, wids, strict=True):
             await self._repo.add_chunk(
                 document_id=doc_id,
                 chunk_index=chunk.chunk_index,
@@ -363,7 +363,7 @@ class IngestionPipeline:
 # ---------------------------------------------------------------------------
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na  = math.sqrt(sum(x * x for x in a))
     nb  = math.sqrt(sum(x * x for x in b))
     return dot / (na * nb) if na and nb else 0.0
@@ -376,7 +376,7 @@ def _deduplicate(
 ) -> tuple[list[TextChunk], list[list[float]]]:
     kept_c: list[TextChunk]   = []
     kept_v: list[list[float]] = []
-    for chunk, vec in zip(chunks, vectors):
+    for chunk, vec in zip(chunks, vectors, strict=True):
         if not any(_cosine(vec, kv) >= threshold for kv in kept_v):
             kept_c.append(chunk)
             kept_v.append(vec)

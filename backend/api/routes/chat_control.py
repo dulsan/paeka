@@ -274,7 +274,7 @@ def _active_id() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 @router.post("/reset", response_model=ResetResponse)
-async def reset_chat(req: ResetRequest = ResetRequest()) -> ResetResponse:
+async def reset_chat(req: ResetRequest | None = None) -> ResetResponse:
     """
     Clear the active (or specified) session's message history and erase the
     corresponding llama.cpp KV-cache slot.
@@ -285,6 +285,17 @@ async def reset_chat(req: ResetRequest = ResetRequest()) -> ResetResponse:
 
     Requires llama-server to have been started with the `--slots` flag.
     """
+    # [FIX] Was `req: ResetRequest = ResetRequest()` -- that default
+    # instance is created exactly once, at function-definition time, and
+    # silently reused by every request that doesn't supply its own body.
+    # Both fields only ever get read below today, so this wasn't visibly
+    # breaking anything yet -- but it's a real latent risk: any future
+    # code that mutates `req` in place (e.g. `req.session_id = ...`) would
+    # leak that state across every other concurrent or subsequent request
+    # using the default. Constructing fresh per-call removes the
+    # possibility entirely rather than relying on nobody ever mutating it.
+    req = req or ResetRequest()
+
     # Resolve session -------------------------------------------------------
     if req.session_id:
         session = session_store.get(req.session_id)
@@ -322,13 +333,15 @@ async def reset_chat(req: ResetRequest = ResetRequest()) -> ResetResponse:
     response_model=SessionInfo,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_session(req: SessionCreateRequest = SessionCreateRequest()) -> SessionInfo:
+async def create_session(req: SessionCreateRequest | None = None) -> SessionInfo:
     """
     Create a new chat session.
 
     The new session immediately becomes the active session. The previous
     session (if any) is preserved in memory — switch back with `/activate`.
     """
+    # [FIX] Same reasoning as reset_chat above.
+    req = req or SessionCreateRequest()
     session = session_store.create(slot=req.slot_id)
     return _to_info(session, session.session_id)
 
