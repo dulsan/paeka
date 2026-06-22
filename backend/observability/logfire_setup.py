@@ -97,6 +97,15 @@ def configure_observability() -> bool:
     # is a normal logging-config decision, not warning suppression.
     logging.getLogger("transformers").setLevel(logging.ERROR)
 
+    # [FIX] Same reasoning as the OTEL_PYTHON_HTTPX_EXCLUDED_URLS
+    # setdefault() elsewhere in this function: primarily set in .env, but
+    # set here too as a fallback in case this module runs before .env is
+    # loaded for any reason. Must happen before sentence-transformers
+    # imports torch/transformers (this function is step 0 of the
+    # lifespan, well before the embedder loads at step 6) -- these
+    # libraries read the env var at import/call time, not continuously.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
     try:
         import logfire
     except ImportError:

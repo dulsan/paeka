@@ -37,6 +37,7 @@ from backend.llm.base import LLMProvider
 logger = logging.getLogger(__name__)
 
 _GENERATOR_PROMPT = """\
+{system_prompt}
 You are an expert assistant working on the following task:
 
 {task}
@@ -117,10 +118,17 @@ class AutonomousIterationGraph:
         self._threshold = score_threshold
         self._graph     = self._build()
 
-    async def run(self, task: str, context: str = "") -> dict[str, Any]:
+    async def run(self, task: str, system_prompt: str = "", context: str = "") -> dict[str, Any]:
+        # [FIX] run() previously had no system_prompt parameter at all, but
+        # backend/api/routes/agent.py's /agent/iterate route calls
+        # graph.run(task=..., system_prompt=..., context=...) -- that was
+        # raising TypeError on every single call to that endpoint, before
+        # ever reaching any of the other bugs below. The IterationState
+        # schema already had a "system_prompt" field; run() just never
+        # accepted or threaded it through.
         initial: IterationState = {
             "task":            task,
-            "system_prompt":   "",
+            "system_prompt":   system_prompt,
             "context":         context,
             "current_output":  "",
             "iteration":       0,
@@ -135,7 +143,21 @@ class AutonomousIterationGraph:
             "converged":       False,
             "error":           None,
         }
-        return await self._graph.ainvoke(initial)
+        final = await self._graph.ainvoke(initial)
+        # [FIX] Previously returned the raw graph state dict directly. The
+        # API route destructures result["iterations"] (plural) twice, but
+        # the state only ever had "iteration" (singular, the in-progress
+        # counter) -- a guaranteed KeyError on every call. Mapping
+        # explicitly here also makes this the single place that defines
+        # the public contract of run()'s return value, separate from the
+        # internal state schema's field names.
+        return {
+            "final_output":      final.get("final_output", "") or final.get("current_output", ""),
+            "iterations":        final.get("iteration", 0),
+            "final_score":       final.get("score", 0.0),
+            "converged":         final.get("converged", False),
+            "critique_history":  final.get("critique_history", []),
+        }
 
     def _build(self) -> Any:
         llm       = self._llm
@@ -184,6 +206,7 @@ async def _generator(s: IterationState, llm: LLMProvider) -> IterationState:
     temp = 0.6 if s.get("iteration", 0) == 0 else 0.4
 
     prompt = _GENERATOR_PROMPT.format(
+        system_prompt=s.get("system_prompt", "") or "",
         task=s["task"],
         context=s.get("context", ""),
         previous_output=previous_output or "None — this is the first attempt.",
@@ -237,24 +260,36 @@ async def _evaluator(s: IterationState, llm: LLMProvider) -> IterationState:
         return {**s, "score": 0.5, "evaluation": str(exc), "already_good": False}
 
     data = _parse_json(raw)
-    score       = float(data.get("score", 0.5))
+    # [FIX] Score was used as-is with no validation -- an LLM reporting
+    # 1.5 or -0.3 (outside the documented 0.0-1.0 scale) would silently
+    # propagate that out-of-range value into score_threshold comparisons
+    # and the API response. Clamp to the documented range.
+    raw_score    = float(data.get("score", 0.5))
+    score        = max(0.0, min(1.0, raw_score))
     already_good = bool(data.get("already_good", False))
-    reasoning   = str(data.get("reasoning", ""))
+    reasoning    = str(data.get("reasoning", ""))
+    threshold    = s.get("score_threshold", 0.85)
+
+    # [FIX] converged was never set anywhere in this function's return --
+    # it stayed at its initial False for the entire run regardless of
+    # actual outcome, since _evaluator only ever did {**s, ...} without
+    # touching this key. /api/agent/iterate's response always reported
+    # converged=False as a result, even on a genuine, clean convergence.
+    converged = score >= threshold or already_good
 
     logger.info(
-        "Evaluator: iteration=%d score=%.2f improved=%s already_good=%s",
-        iteration, score, data.get("improved_over_previous"), already_good,
+        "Evaluator: iteration=%d score=%.2f improved=%s already_good=%s converged=%s",
+        iteration, score, data.get("improved_over_previous"), already_good, converged,
     )
 
-    final_output = current_output if (
-        score >= s.get("score_threshold", 0.85) or already_good
-    ) else s.get("final_output", "")
+    final_output = current_output if converged else s.get("final_output", "")
 
     return {
         **s,
         "score":        score,
         "evaluation":   reasoning,
         "already_good": already_good,
+        "converged":    converged,
         "final_output": final_output or current_output,
     }
 
@@ -278,7 +313,11 @@ async def _reflector(s: IterationState, llm: LLMProvider) -> IterationState:
         critique = f"Reflector failed: {exc}"
 
     history = list(s.get("critique_history", []))
-    history.append(critique)
+    # [FIX] Critique entries were stored with no indication of which
+    # iteration they came from -- made the history hard to read back when
+    # debugging a run that took several rounds to converge (or didn't).
+    iteration = s.get("iteration", 0)
+    history.append(f"[Iteration {iteration}] {critique}")
     return {**s, "critique": critique, "critique_history": history}
 
 

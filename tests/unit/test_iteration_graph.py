@@ -79,7 +79,15 @@ async def test_evaluator_extracts_score():
     llm = MagicMock()
     llm.complete = AsyncMock(return_value='{"score": 0.92, "evaluation": "Excellent haiku.", "already_good": true}')
 
-    state = _base_state(current_output="Indented lines flow...")
+    # [FIX] iteration=1 added. _generator always runs before _evaluator in
+    # the real graph, incrementing iteration from 0 to 1 -- by the time
+    # _evaluator ever sees a state, iteration is already >= 1. Testing
+    # _evaluator in isolation with the bare default (iteration=0) asserted
+    # a precondition that can't actually occur in the real pipeline.
+    # Confirmed correct against test_full_pipeline_converges, which
+    # exercises the real generator->evaluator flow end-to-end and
+    # correctly gets iterations == 1.
+    state = _base_state(current_output="Indented lines flow...", iteration=1)
     result = await _evaluator(state, llm)
 
     assert result["score"] == pytest.approx(0.92)

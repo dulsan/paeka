@@ -220,6 +220,36 @@ async def list_models(request: Request) -> OAIModelList:
     return OAIModelList(data=[OAIModelEntry(id=m) for m in backend_models])
 
 
+def _is_model_not_found_error(status_code: int, body_text: str) -> bool:
+    """
+    [FIX] Detect Ollama's specific "model not found" error shape so the
+    request can be retried once against this server's own configured
+    model instead of failing outright.
+
+    Real-world motivation: a client (e.g. Terax's generic "Custom
+    endpoint" connector type) can end up sending a stale or wrong model
+    identifier in the request body -- confirmed happening repeatedly in
+    practice with a string like "Qwen3.5-9B-Q4_K_M" (a filesystem-derived
+    display name from PAEKA's own model registry) instead of the actual
+    Ollama tag "paeka-qwen". That's a client-side selection issue, not a
+    PAEKA bug -- but PAEKA is in a position to be more resilient to it
+    regardless of which client sends a wrong model name, by falling back
+    to the model this server was actually configured to serve.
+
+    Confirmed against a real captured Ollama response for this exact
+    scenario: {"error":{"message":"model 'X' not found",
+    "type":"not_found_error","param":null,"code":null}}
+    """
+    if status_code != 404:
+        return False
+    try:
+        err = json.loads(body_text).get("error", {})
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    message = (err.get("message") or "").lower()
+    return err.get("type") == "not_found_error" and "model" in message and "not found" in message
+
+
 @router.post("/chat/completions", response_model=None)
 async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
     """
@@ -256,11 +286,7 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
                 detail=f"Message blocked: {scan.findings[0]}",
             )
 
-    # [FIX] model_id was assigned here and never read anywhere -- confirmed
-    # _build_payload() independently recomputes the identical expression
-    # for payload["model"], and the response's model field is passed
-    # through from Ollama's own response, not derived from this variable.
-    # Genuinely dead code, not a functional gap.
+    model_id      = body.model or settings.llm.model or "paeka-model"
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created_ts    = int(time.time())
 
@@ -283,39 +309,51 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
         payload = _build_payload(body, messages, stream=True, settings=settings)
 
         async def _stream():
+            attempt_payload = payload
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(
                     connect=10.0, read=float(settings.llm.request_timeout),
                     write=30.0, pool=5.0
                 )) as client:
-                    async with client.stream("POST", llama_url,
-                                             json=payload, headers=headers) as resp:
-                        # [FIX] raise_for_status()'s default exception string
-                        # is just "Client error '404 Not Found' for url
-                        # '...'" -- it does not include the response body.
-                        # For a streaming response the body is exactly what
-                        # tells us WHY the backend rejected the request (e.g.
-                        # an Ollama/llama.cpp error explaining the model
-                        # doesn't support the requested feature). Read and
-                        # log it explicitly before raising, since
-                        # raise_for_status() consumes the response state.
-                        if resp.is_error:
-                            error_body = await resp.aread()
-                            logger.error(
-                                "openai_compat stream error: backend returned %d for %s -- body: %s",
-                                resp.status_code, llama_url, error_body.decode(errors="replace")[:1000],
-                            )
-                            resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    yield "data: [DONE]\n\n"
-                                    break
-                                # Pass chunks through unchanged — llama.cpp
-                                # already formats them as OpenAI stream chunks
-                                # including tool_call deltas
-                                yield f"data: {data_str}\n\n"
+                    for attempt in range(2):
+                        async with client.stream("POST", llama_url,
+                                                 json=attempt_payload, headers=headers) as resp:
+                            if resp.is_error:
+                                error_body = await resp.aread()
+                                body_text  = error_body.decode(errors="replace")
+                                # [FIX] If this is specifically "model not found"
+                                # and we haven't already retried, swap to this
+                                # server's own configured model and try once
+                                # more before giving up. See
+                                # _is_model_not_found_error()'s docstring for
+                                # the real-world Terax scenario this covers.
+                                if (attempt == 0
+                                        and _is_model_not_found_error(resp.status_code, body_text)
+                                        and attempt_payload.get("model") != settings.llm.model):
+                                    logger.warning(
+                                        "Model '%s' not found on backend -- retrying with this "
+                                        "server's configured model '%s'. If this persists, check "
+                                        "the client's model selection.",
+                                        attempt_payload.get("model"), settings.llm.model,
+                                    )
+                                    attempt_payload = {**attempt_payload, "model": settings.llm.model}
+                                    continue
+                                logger.error(
+                                    "openai_compat stream error: backend returned %d for %s -- body: %s",
+                                    resp.status_code, llama_url, body_text[:1000],
+                                )
+                                resp.raise_for_status()
+                            async for line in resp.aiter_lines():
+                                if line.startswith("data: "):
+                                    data_str = line[6:].strip()
+                                    if data_str == "[DONE]":
+                                        yield "data: [DONE]\n\n"
+                                        break
+                                    # Pass chunks through unchanged — llama.cpp
+                                    # already formats them as OpenAI stream chunks
+                                    # including tool_call deltas
+                                    yield f"data: {data_str}\n\n"
+                            break
             except httpx.HTTPStatusError as exc:
                 # Body and status already logged with full detail above,
                 # right before raise_for_status() raised this. Don't log
@@ -344,6 +382,20 @@ async def chat_completions(body: OAIChatRequest, request: Request) -> Response:
             write=30.0, pool=5.0
         )) as client:
             resp = await client.post(llama_url, json=payload, headers=headers)
+            # [FIX] Same model-not-found retry as the streaming path above --
+            # see _is_model_not_found_error()'s docstring for the real-world
+            # scenario this covers.
+            if (resp.is_error
+                    and _is_model_not_found_error(resp.status_code, resp.text)
+                    and payload.get("model") != settings.llm.model):
+                logger.warning(
+                    "Model '%s' not found on backend -- retrying with this "
+                    "server's configured model '%s'. If this persists, check "
+                    "the client's model selection.",
+                    payload.get("model"), settings.llm.model,
+                )
+                payload = {**payload, "model": settings.llm.model}
+                resp = await client.post(llama_url, json=payload, headers=headers)
             # [FIX] Same reasoning as the streaming path above -- capture the
             # actual response body before raise_for_status() raises, since
             # the exception's default string form discards it entirely.
