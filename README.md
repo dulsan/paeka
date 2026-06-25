@@ -20,7 +20,7 @@ The project is designed for users who want a private, extensible AI assistant ca
 
 ### Local-First AI Assistant
 
-* Runs against local `llama.cpp` servers
+* Runs against local LLM backends (Ollama by default; llama.cpp, LiteLLM, and SGLang providers also available)
 * OpenAI-compatible API support
 * No cloud dependency required
 * Configurable local GGUF models
@@ -111,13 +111,13 @@ The project is designed for users who want a private, extensible AI assistant ca
       ┌───────────---───────────┐
       ▼           ▼           ▼
 ┌──────────┐ ┌──────────┐ ┌──────────┐
-│ Memory   │ │ Weaviate │ │ KG Store │
+│ Memory   │ │ Qdrant   │ │ KG Store │
 └──────────┘ └──────────┘ └──────────┘
       |           |           |
       ▼           ▼           ▼
 ┌─────────────────────────────────────┐
 │         Local LLM Backend           │
-│         llama.cpp Server            │
+│      Ollama (default) / llama.cpp   │
 └─────────────────────────────────────┘
 ```
 
@@ -199,7 +199,7 @@ Capabilities:
 * Hybrid search
 * Re-ranking
 * Multi-hop retrieval
-* Weaviate integration
+* Qdrant integration
 * Embedding generation
 
 Default models:
@@ -324,7 +324,7 @@ paeka/
 
 * Python 3.12+ (preferably v3.14.2)
 * UV Package Manager
-* Docker Desktop 
+* Docker Engine + Compose plugin (no Docker Desktop needed -- see SETUP_DOCKER.md for the one-command containerized setup)
 
 ## Optional
 
@@ -342,67 +342,59 @@ git clone https://github.com/dulsan/paeka.git
 cd paeka
 ```
 
-## 2. Install Dependencies
+## 2. Choose a path
+
+**Option A: Docker (recommended)** — one command brings up Qdrant, Ollama
+(with GPU passthrough), and the API together, networked and configured to
+talk to each other automatically:
 
 ```bash
-uv sync
-# Development dependencies:
+docker compose up -d --build
+```
+
+First start takes a while (10-15 minutes is normal) — Ollama has to import
+your GGUF and the API container has to download the embedding/reranker
+models into its cache. Watch progress with:
+
+```bash
+docker compose logs -f paeka-api
+```
+
+Once `docker compose ps` shows `paeka-api` as `healthy`, the app is at
+`http://localhost:8000`. Full setup details (GPU passthrough, rootless
+engine setup, Docker Desktop notes, troubleshooting) are in
+[SETUP_DOCKER.md](SETUP_DOCKER.md) — read it before your first run if
+anything below is unclear, since several of its prerequisites (GPU
+toolkit, freeing up ports already used by a native install) need to be in
+place *before* `docker compose up` for that command to actually be "one
+command."
+
+**Option B: Native** — runs everything directly on the host, no
+containers. More moving parts to manage yourself, but no Docker overhead
+and faster iteration if you're actively developing the backend.
+
+```bash
 uv sync --extra dev
 ```
 
----
-
-## 3. Start Qdrant Vector Store
+Start Qdrant:
 
 ```bash
-# Download qdrant.exe from:
+# Download qdrant.exe (or the Linux/macOS equivalent) from:
 # https://github.com/qdrant/qdrant/releases
-# Look for: qdrant-x86_64-pc-windows-msvc.zip
-
-# Run in a terminal:
-.\bin\qdrant.exe
-
-# Verify:
-curl http://localhost:6333/healthz
+.\bin\qdrant.exe --config-path config\qdrant.yaml
 ```
 
----
-
-## 4. Start Ollama (LLM Backend)
+Start Ollama and import the model:
 
 ```bash
-# Download from: https://ollama.ai
-# Then start the service:
 ollama serve
-```
-
-In another terminal, create the model:
-
-```bash
+# in another terminal:
 ollama create paeka-qwen -f models\qwen\Modelfile
 ```
 
-Verify:
-
-```bash
-curl http://localhost:11434/v1/models
-```
-
----
-
-
-
----
-
-## 5. Configure (Optional)
-
-Edit:
-
-```text
-config/settings.toml
-```
-
-Important sections:
+Configure (optional) — edit `config/settings.toml`, or override via `.env`
+(copy `.env.example` to `.env` first):
 
 ```toml
 [llm]
@@ -412,46 +404,25 @@ model = "paeka-qwen"
 
 [retrieval]
 enabled = true
-
-[memory]
-enabled = true
-
-[tools]
-web_search_enabled = false  # Set true to enable with SearXNG
+qdrant_url = "http://localhost:6333"
 
 [sandbox]
-enabled = true  # Requires Docker Desktop
+enabled = true  # requires a reachable Docker daemon -- see SETUP_DOCKER.md
 ```
 
----
-
-## 6. Start PAEKA
-
-Windows (PowerShell):
-
-```powershell
-cd "C:\path\to\paeka"
-uv sync
-uv run python main.py
-```
-
-**Note:** OneDrive integration can cause synchronization issues. If you experience problems, ensure the paeka directory is excluded from OneDrive sync.
-
-Manual with uv:
+Start PAEKA:
 
 ```bash
 uv run python main.py
 ```
 
-Or direct uvicorn:
+**Note:** if your checkout lives inside OneDrive (or another sync
+client), exclude the folder from sync — OneDrive's placeholder/sync layer
+has caused real data-loss and slow-file-access issues with Qdrant's
+storage and the multi-GB GGUF in past runs.
 
-```bash
-uv run uvicorn backend.api.app:create_app --host 0.0.0.0 --port 8000 --factory
-```
-
-The application will be available at: `http://localhost:8000`
-
-API documentation: `http://localhost:8000/docs` (if enabled in settings)
+The app is available at `http://localhost:8000` either way. API docs (if
+enabled in settings) at `http://localhost:8000/docs`.
 
 ---
 
@@ -469,7 +440,7 @@ API documentation: `http://localhost:8000/docs` (if enabled in settings)
 | GET /api/models                   | Available models       |
 | POST /v1/chat/completions         | OpenAI-compatible chat |
 
-For complete documentation see the follwing document:
+For complete documentation see the following document:
 
 ```text
 API_REFERENCE.md
@@ -479,6 +450,9 @@ API_REFERENCE.md
 # Development
 
 ```bash
+# First time / after pulling changes:
+uv sync --extra dev
+
 # Run tests:
 uv run pytest
 
@@ -497,11 +471,11 @@ uv run pyright
 
 | File                                  | Purpose                  |
 | ------------------------------------- | ------------------------ |
-| SETUP.md                              | Installation and setup   |
+| **SETUP_DOCKER.md**                   | Docker setup (GPU, rootless, troubleshooting) |
 | API_REFERENCE.md                      | REST API documentation   |
 | FIXES.md                              | Known issues and fixes   |
 | docs/REVIEW.md                        | Code review findings     |
-| WEAVIATE_RAFT_CLUSTER_ISSUE_REPORT.md | Weaviate troubleshooting |
+| ~~SETUP.md~~                          | **Outdated** -- written for a previous SGLang + Weaviate architecture (tagged v0.7.0; current is v0.11.3+). Use this README + SETUP_DOCKER.md instead until it's rewritten. |
 
 ---
 
@@ -536,7 +510,7 @@ Use hard-learned lessons to build a defensive local environment.
 
 ## Phase 4: Dockerization & Advanced Features
 
-- **Containerization:** Transition to `docker-compose` for reproducible, isolated deployments. Self-hosted Langfuse integration.
+- **Containerization:** Done -- see [SETUP_DOCKER.md](SETUP_DOCKER.md) for the one-command, rootless, GPU-passthrough `docker compose up` setup (Qdrant + Ollama + API). Self-hosted Langfuse integration still open.
 - **Advanced Architecture:** Hardened code sandboxes, long-context graph compression, CPU-bound router model testing.
 - **Production Hardening:** Structured error handling, graceful degradation, and comprehensive observability.
 

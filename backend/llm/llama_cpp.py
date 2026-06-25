@@ -125,14 +125,15 @@ class LlamaCppProvider(LLMProvider):
         Note: /health is at the server root, not under /v1.
         We hit it by stripping the base_url's /v1 prefix.
         """
-        # /health is not under /v1 — construct the root URL directly
+        # /health is not under /v1 — pass an absolute URL so it bypasses
+        # self._http's base_url instead of spinning up a second, unmocked,
+        # never-closed client just for this one probe.
         root_url = str(self._settings.base_url).rstrip("/").removesuffix("/v1")
         try:
-            async with httpx.AsyncClient(timeout=5.0) as tmp:
-                resp = await tmp.get(f"{root_url}/health")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("status") in ("ok", "loading model")
+            resp = await self._http.get(f"{root_url}/health", timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("status") in ("ok", "loading model")
         except Exception:  # noqa: BLE001
             pass
         # Fallback: try /v1/models via the regular client

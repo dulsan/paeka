@@ -269,16 +269,16 @@ class QdrantStore:
                     must=[FieldCondition(key=prop, match=MatchValue(value=val))]
                 )
 
-        results = await client.search(
+        response = await client.query_points(
             collection_name=collection_name,
-            query_vector=vector,
+            query=vector,
             limit=limit,
             with_payload=True,
             query_filter=qdrant_filter,
         )
 
         hits: list[SearchHit] = []
-        for point in results:
+        for point in response.points:
             p = point.payload or {}
             hits.append(SearchHit(
                 weaviate_id=str(point.id),
@@ -312,7 +312,8 @@ class QdrantStore:
         To enable true hybrid search later:
           1. Add sparse vector config to the collection
           2. Encode query_text with a sparse encoder (e.g. BM25 via fastembed)
-          3. Use client.search() with named_vectors for both dense and sparse
+          3. Use client.query_points() with prefetch + FusionQuery (RRF) to
+             combine dense and sparse named vectors server-side
         """
         return await self.search(vector=query_vector, limit=top_k)
 

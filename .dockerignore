@@ -16,6 +16,9 @@ __pycache__/
 data/
 database/
 
+models/**/*.gguf
+models/**/*.gguf.part
+
 *.db
 *.sqlite
 *.sqlite3

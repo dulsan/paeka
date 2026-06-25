@@ -217,6 +217,22 @@ class Settings(BaseSettings):
 
     deploy_mode: str = "development"
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # Default order is (init, env, dotenv, secrets) -- earlier wins.
+        # That makes the TOML dict passed in via Settings(**raw) in
+        # get_settings() unconditionally beat PAEKA_* env vars, since it
+        # arrives as init kwargs. Env vars and .env are meant to override
+        # the static TOML file, so they need to come first instead.
+        return env_settings, dotenv_settings, init_settings, file_secret_settings
+
     def model_post_init(self, __context: Any) -> None:
         if self.deploy_mode != "development" and self.deploy.mode == "development":
             object.__setattr__(self, "deploy",

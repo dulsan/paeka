@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -194,11 +194,11 @@ async def test_pipeline_uses_hybrid_chunker_for_docling():
     await db.connect()
 
     store = MagicMock()
-    store.upsert_chunks = MagicMock(return_value=["wid-1", "wid-2"])
+    store.upsert_chunks = AsyncMock(return_value=["wid-1"])
     store.delete_document_chunks = MagicMock()
 
     embedder = MagicMock()
-    embedder.encode = MagicMock(return_value=[[0.1] * 10, [0.2] * 10])
+    embedder.encode_async = AsyncMock(return_value=[[0.1] * 10, [0.2] * 10])
 
     rsettings = RetrievalSettings(enabled=True)
     isettings = IngestionSettings(dedup_threshold=0.0)

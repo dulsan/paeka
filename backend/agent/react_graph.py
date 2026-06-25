@@ -353,4 +353,12 @@ def _get_llm_from_config(cfg: dict) -> ChatOllama:
         return llm
     # Fallback default, in case config["configurable"]["llm"] wasn't set --
     # should not normally happen since ReActGraph.run() always sets it.
-    return ChatOllama(model="paeka-qwen", base_url="http://localhost:11434")
+    # Mirrors the same base-URL derivation app.py uses for app.state.chat_ollama
+    # rather than hardcoding localhost, which would silently point at the
+    # wrong host once Ollama is running in its own container.
+    from backend.shared.config import get_settings
+    settings = get_settings()
+    base = settings.llm.base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return ChatOllama(model=settings.llm.model, base_url=base)

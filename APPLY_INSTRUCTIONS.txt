@@ -1,0 +1,57 @@
+How to apply this bundle to your local paeka checkout
+======================================================
+
+1. Extract this zip's contents directly into your repo root, overwriting
+   in place (every path here mirrors the repo's own structure):
+
+     .dockerignore
+     .env.example
+     Dockerfile
+     README.md
+     SETUP_DOCKER.md                          <- new file
+     docker-compose.yml
+     test-paeka-api.ps1
+     backend/agent/react_graph.py
+     backend/api/routes/chat_control.py
+     backend/llm/llama_cpp.py
+     backend/retrieval/qdrant_store.py
+     backend/security/content.py
+     backend/shared/config.py
+     backend/tools/diagnostics.py
+     tests/unit/test_diagnostics.py           <- new file
+     tests/unit/test_docling_integration.py
+
+2. Delete this file manually -- it's obsolete (replaced by the existing
+   test_backward_compat_llm_client_alias in test_llm_providers.py):
+
+     tests/unit/test_llm_client.py
+
+3. Your .env was NOT touched or deleted -- it's still on your disk exactly
+   as it was. The only change is that it's no longer tracked by git going
+   forward (no real secrets were in it, but it predated .gitignore and
+   shouldn't have been committed). If you want the same in your own repo:
+
+     git rm --cached .env
+     git commit -m "Stop tracking .env"
+
+4. Then run:
+
+     uv sync --extra dev
+     uv run pytest tests/unit/ tests/integration/ -q
+
+   All 155 should pass (was 29 passed / 3 failed / 5 skipped in your last
+   run, plus several latent bugs the full suite didn't even cover until
+   the missing test deps -- aiosqlite, langgraph, python-multipart -- are
+   installed via `uv sync --extra dev`).
+
+5. For the PowerShell test script, your previous failures (List sessions,
+   Create session, Agent: iterate) should now pass too -- run it the same
+   way you did before:
+
+     .\test-paeka-api.ps1
+
+6. Dockerization is new in this bundle -- see SETUP_DOCKER.md for the
+   one-command `docker compose up -d --build` setup (Qdrant + Ollama w/
+   GPU + the API). That part hasn't been build-tested on real Docker
+   (this environment had no Docker daemon or registry access) -- worth
+   watching `docker compose logs -f` closely on the first run.

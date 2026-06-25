@@ -11,17 +11,52 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-_SERVICES: list[dict] = [
-    {"name": "Ollama (LLM)",       "host": "localhost", "port": 11434, "http_path": "/api/tags",  "critical": True},
-    {"name": "Qdrant (vector DB)", "host": "localhost", "port": 6333,  "http_path": "/healthz",   "critical": True},
-    {"name": "PAEKA API",          "host": "localhost", "port": 8000,  "http_path": "/api/health", "critical": False},
-    {"name": "SearXNG (web search)", "host": "localhost", "port": 8888, "http_path": "/healthz",  "critical": False},
-]
+
+def _split(url: str, default_host: str, default_port: int) -> tuple[str, int]:
+    """Best-effort host/port extraction; falls back to the given default."""
+    try:
+        parsed = urlparse(url)
+        return parsed.hostname or default_host, parsed.port or default_port
+    except Exception:  # noqa: BLE001
+        return default_host, default_port
+
+
+def _build_services() -> list[dict]:
+    """
+    Resolve actual configured hosts/ports rather than assuming everything
+    is on localhost -- true for the native dev setup, false as soon as
+    Ollama/Qdrant/SearXNG move into their own containers reachable only by
+    service name.
+    """
+    try:
+        from backend.shared.config import get_settings
+        settings = get_settings()
+        llm_host, llm_port   = _split(settings.llm.base_url, "localhost", 11434)
+        qd_host,  qd_port    = _split(settings.retrieval.qdrant_url, "localhost", 6333)
+        sx_host,  sx_port    = _split(settings.tools.searxng_url, "localhost", 8888)
+        api_port             = settings.server.port
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("diagnostics: falling back to localhost defaults (%s)", exc)
+        llm_host, llm_port = "localhost", 11434
+        qd_host,  qd_port  = "localhost", 6333
+        sx_host,  sx_port  = "localhost", 8888
+        api_port            = 8000
+
+    return [
+        {"name": "Ollama (LLM)",         "host": llm_host, "port": llm_port, "http_path": "/api/tags",  "critical": True},
+        {"name": "Qdrant (vector DB)",   "host": qd_host,  "port": qd_port,  "http_path": "/healthz",   "critical": True},
+        # The API checking itself is always self-referential -- localhost
+        # is correct here even inside a container.
+        {"name": "PAEKA API",            "host": "localhost", "port": api_port, "http_path": "/api/health", "critical": False},
+        {"name": "SearXNG (web search)", "host": sx_host,  "port": sx_port,  "http_path": "/healthz",   "critical": False},
+    ]
+
 
 Status = Literal["ok", "degraded", "down", "unknown"]
 
@@ -91,7 +126,8 @@ async def run_diagnostics(timeout: float = 3.0) -> DiagnosticReport:
             status=status, latency_ms=latency, http_code=code,
             error=error, critical=svc.get("critical", False),
         )
-    results = await asyncio.gather(*[_probe(s) for s in _SERVICES])
+    services = _build_services()
+    results = await asyncio.gather(*[_probe(s) for s in services])
     return DiagnosticReport(services=list(results))
 
 

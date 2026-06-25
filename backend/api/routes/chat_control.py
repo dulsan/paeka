@@ -53,7 +53,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/chat", tags=["chat-control"])
+router = APIRouter(prefix="/chat", tags=["chat-control"])
 
 
 # ---------------------------------------------------------------------------

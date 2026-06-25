@@ -73,8 +73,8 @@ _INJECTION_BLOCK: list[re.Pattern] = [p for p in [
     re.compile(r"pretend\s+(you\s+are|to\s+be)\s+(?!PAEKA)", re.I),
     re.compile(r"act\s+as\s+(if\s+you\s+(are|were)\s+)?(?!PAEKA)", re.I),
     re.compile(r"jailbreak|DAN\s+mode|developer\s+mode", re.I),
-    re.compile(r"reveal\s+(your\s+)?(system\s+prompt|instructions?|training)", re.I),
-    re.compile(r"print\s+(your\s+)?(system\s+prompt|full\s+prompt)", re.I),
+    re.compile(r"reveal\s+(your\s+)?(full\s+|complete\s+|entire\s+)?(system\s+prompt|instructions?|training)", re.I),
+    re.compile(r"print\s+(your\s+)?(full\s+|complete\s+|entire\s+)?(system\s+prompt|full\s+prompt)", re.I),
 ]]
 
 # WARN-level: suspicious but may be legitimate (log + tag, don't block)

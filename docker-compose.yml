@@ -1,66 +1,155 @@
 # =============================================================================
-# PAEKA — Docker Compose (native Windows deployment)
+# PAEKA — docker-compose.yml
 # =============================================================================
-# Only Weaviate runs in Docker here. llama-server and the PAEKA API run
-# natively via start.ps1 (see scripts/start.ps1).
+# One command launches the whole agent:
 #
-# Weaviate is exposed on host port 8090 to avoid clashing with llama-server
-# which uses 8080. The PAEKA API connects to http://localhost:8090 as set in .env.
+#   docker compose up -d --build
 #
-# Weaviate uses a Docker named volume (weaviate_data) for persistence.
-# This avoids RAFT cluster state corruption from host-side bind mounts.
+# Three services:
+#   paeka-qdrant       Vector DB (replaces native bin/qdrant.exe)
+#   paeka-ollama       LLM server with GPU passthrough (replaces native
+#                      `ollama serve` + manual `ollama create`)
+#   paeka-api          The FastAPI app itself (this repo's Dockerfile)
 #
-# Commands:
-#   Start Weaviate: docker compose up -d paeka-weaviate
-#   Stop (data preserved): docker compose down
-#   Fresh start (wipe vector DB): docker compose down -v
+# Plus one short-lived helper:
+#   paeka-ollama-init  Runs `ollama create paeka-qwen -f Modelfile` once
+#                      paeka-ollama is up, then exits. Re-runs (cheaply,
+#                      idempotently) on every `up` so Modelfile edits are
+#                      always picked up.
+#
+# Rootless / no-Docker-Desktop notes (can't be set from this file alone --
+# see SETUP_DOCKER.md):
+#   - This file works the same whether your engine is a rootless Docker
+#     Engine, Podman, or Docker Desktop -- "no Desktop" is the lower-
+#     overhead path SETUP_DOCKER.md walks through, not something this
+#     compose file enforces. If you're already on Docker Desktop (Windows,
+#     WSL2 backend), GPU passthrough below is handled by Desktop's own
+#     bundled WSL2 GPU support -- you don't need to separately install
+#     NVIDIA Container Toolkit inside a distro the way SETUP_DOCKER.md
+#     describes for a bare Engine; just make sure Desktop's Settings ->
+#     Resources -> GPU support is on and the Windows-side NVIDIA driver
+#     (not a WSL-internal one) is installed.
+#   - qdrant/qdrant:*-unprivileged already runs as a non-root user inside
+#     its container. ollama/ollama's image runs as root by default --
+#     GPU passthrough + non-root-in-container is a genuinely awkward
+#     combination upstream, so this is left as-is rather than guessing at
+#     a fix that might silently break GPU access. The meaningful rootless
+#     boundary here is the *engine* (dockerd-rootless / Podman), which
+#     protects the host regardless of what a given container's own PID 1
+#     runs as.
+#   - All published ports are bound to 127.0.0.1 only (nothing exposed to
+#     the LAN) except the API itself, matching its existing
+#     server.host = "0.0.0.0" in config/settings.toml. Before first launch,
+#     make sure nothing native (qdrant.exe, ollama serve, a leftover
+#     `uv run python main.py`) is still bound to 6333/6334/8000 on the
+#     host -- same class of conflict as the Ollama one this file just
+#     sidestepped by not publishing 11434 at all.
 # =============================================================================
-
-volumes:
-  weaviate_data:
 
 services:
-
-  paeka-weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
-    container_name: paeka-weaviate
+  paeka-qdrant:
+    image: qdrant/qdrant:v1.18.2-unprivileged
+    container_name: paeka-qdrant
     restart: unless-stopped
-    ports:
-      - "8090:8080"   # host 8090 → container 8080 (llama-server already owns 8080)
-      - "50051:50051"  # gRPC
-    volumes:
-      - weaviate_data:/var/lib/weaviate
     environment:
-      QUERY_DEFAULTS_LIMIT:                    "25"
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
-      PERSISTENCE_DATA_PATH:                   "/var/lib/weaviate"
-      DEFAULT_VECTORIZER_MODULE:               "none"
-      ENABLE_MODULES:                          ""
-      # Increase raft heartbeat timeouts to reduce spurious leader-election
-      # restarts that can make Weaviate appear unresponsive on slow Docker Desktop starts.
-      RAFT_HEARTBEAT_TIMEOUT:                  "5000"
-      RAFT_ELECTION_TIMEOUT:                   "10000"
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__SERVICE__MAX_REQUEST_SIZE_MB: "256"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"   # REST + dashboard (http://localhost:6333/dashboard)
+      - "127.0.0.1:6334:6334"   # gRPC
     healthcheck:
-      # Health probe runs inside the container on the internal port (8080)
-      test: ["CMD", "wget", "--no-verbose", "--tries=1",
-             "--spider", "http://localhost:8080/v1/.well-known/ready"]
-      interval: 15s
-      timeout:  10s
-      retries:  10
-      # Increased from 30s: Weaviate can take 60+ s on first raft journal replay
-      start_period: 60s
+      # qdrant/qdrant deliberately ships without curl/wget (a security
+      # decision upstream, see qdrant/qdrant#3491 and #4250) -- a bare TCP
+      # check via bash's /dev/tcp needs nothing extra installed.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
-# =============================================================================
-# Future additions (uncomment when ready):
-#
-#   paeka-searxng:
-#     image: searxng/searxng:latest
-#     container_name: paeka-searxng
-#     restart: unless-stopped
-#     ports:
-#       - "8888:8888"
-#     volumes:
-#       - ./infra/searxng:/etc/searxng:rw
-#     environment:
-#       SEARXNG_BASE_URL: "http://localhost:8888"
-# =============================================================================
+  paeka-ollama:
+    image: ollama/ollama:latest
+    container_name: paeka-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      # 9B model fully offloaded to GPU (see models/qwen/Modelfile,
+      # num_gpu 99) -- cap parallel requests to avoid CUDA OOM on a single
+      # GPU. Raise this if your card has headroom to spare.
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./models/qwen:/models/qwen:ro
+    # No host port published on purpose: paeka-api reaches this over the
+    # internal Docker network at http://paeka-ollama:11434, so exposing
+    # 11434 to the host isn't needed -- and doing so collides with a
+    # native Ollama install, which commonly auto-starts as a background/
+    # tray service on Windows and never lets go of that port. If you want
+    # host-side access too (e.g. to `curl localhost:11435/api/tags` or
+    # point a native `ollama` CLI at this container), first make sure
+    # nothing native already owns whichever port you pick, then add:
+    #   ports:
+    #     - "127.0.0.1:11435:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      # Uses the ollama binary already in the image -- no curl/wget needed.
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  paeka-ollama-init:
+    image: ollama/ollama:latest
+    container_name: paeka-ollama-init
+    restart: "no"
+    depends_on:
+      paeka-ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "paeka-ollama:11434"
+    volumes:
+      - ./models/qwen:/models/qwen:ro
+    entrypoint: ["ollama"]
+    # `ollama create` overwrites an existing model of the same name, so
+    # re-running this on every `up` is safe and picks up Modelfile edits.
+    command: ["create", "paeka-qwen", "-f", "/models/qwen/Modelfile"]
+
+  paeka-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paeka-api
+    restart: unless-stopped
+    depends_on:
+      paeka-qdrant:
+        condition: service_healthy
+      paeka-ollama-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # Overrides for container networking -- everything else in .env
+      # (security, HF hub, OTEL, etc.) still applies as-is.
+      PAEKA_LLM__BASE_URL: "http://paeka-ollama:11434/v1"
+      PAEKA_RETRIEVAL__QDRANT_URL: "http://paeka-qdrant:6333"
+    volumes:
+      - paeka_data:/app/data
+      - paeka_database:/app/database
+      - ./models:/app/models:ro
+    ports:
+      - "8000:8000"
+
+volumes:
+  qdrant_storage:
+  ollama_data:
+  paeka_data:
+  paeka_database:

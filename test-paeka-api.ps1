@@ -83,6 +83,7 @@ function Invoke-PaekaTest {
         [int[]]$ExpectedStatus = @(200),
         [bool]$Skip = $false,
         [string]$SkipReason = "",
+        [int]$TimeoutSec = 120,
         [scriptblock]$Validate = $null   # optional: receives parsed response, return $true/$false
     )
 
@@ -104,7 +105,7 @@ function Invoke-PaekaTest {
             Uri                = $uri
             Method             = $Method
             SkipHttpErrorCheck = $true
-            TimeoutSec         = 120
+            TimeoutSec         = $TimeoutSec
         }
         if ($null -ne $Body) {
             $params.Body        = ($Body | ConvertTo-Json -Depth 10)
@@ -358,7 +359,7 @@ Write-Section "Agent"
 
 Invoke-PaekaTest -Name "Agent: iterate" -Method POST -Path "/api/agent/iterate" `
     -Body @{ task = "Write a one-sentence description of a haiku."; max_iterations = 2 } `
-    -Skip $SkipSlow -SkipReason "skipped via -SkipSlow" `
+    -Skip $SkipSlow -SkipReason "skipped via -SkipSlow" -TimeoutSec 300 `
     -Validate { param($r) $r.PSObject.Properties.Name -contains "iterations" } | Out-Null
 
 Invoke-PaekaTest -Name "Agent: react (tool-calling loop)" -Method POST -Path "/api/agent/react" `
@@ -385,18 +386,18 @@ Invoke-PaekaTest -Name "Chat completions (non-streaming)" -Method POST -Path "/v
 # ---------------------------------------------------------------------------
 Write-Section "Chat control / sessions"
 
-Invoke-PaekaTest -Name "List sessions" -Method GET -Path "/api/sessions" | Out-Null
+Invoke-PaekaTest -Name "List sessions" -Method GET -Path "/api/chat/sessions" | Out-Null
 
-$session = Invoke-PaekaTest -Name "Create session" -Method POST -Path "/api/sessions" `
+$session = Invoke-PaekaTest -Name "Create session" -Method POST -Path "/api/chat/sessions" `
     -ExpectedStatus @(201) -Validate { param($r) $null -ne $r.session_id }
 
 $sessionId = if ($session) { $session.session_id } else { $null }
 
 if ($sessionId) {
-    Invoke-PaekaTest -Name "Get session" -Method GET -Path "/api/sessions/$sessionId" | Out-Null
-    Invoke-PaekaTest -Name "Activate session" -Method POST -Path "/api/sessions/$sessionId/activate" | Out-Null
-    Invoke-PaekaTest -Name "Reset chat" -Method POST -Path "/api/reset" -Body @{ session_id = $sessionId } | Out-Null
-    Invoke-PaekaTest -Name "Delete session (cleanup)" -Method DELETE -Path "/api/sessions/$sessionId" `
+    Invoke-PaekaTest -Name "Get session" -Method GET -Path "/api/chat/sessions/$sessionId" | Out-Null
+    Invoke-PaekaTest -Name "Activate session" -Method POST -Path "/api/chat/sessions/$sessionId/activate" | Out-Null
+    Invoke-PaekaTest -Name "Reset chat" -Method POST -Path "/api/chat/reset" -Body @{ session_id = $sessionId } | Out-Null
+    Invoke-PaekaTest -Name "Delete session (cleanup)" -Method DELETE -Path "/api/chat/sessions/$sessionId" `
         -ExpectedStatus @(204) | Out-Null
 } else {
     Write-Host "  [SKIP] Remaining session tests -- create failed, no session_id to use" -ForegroundColor DarkYellow

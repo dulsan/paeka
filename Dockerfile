@@ -1,27 +1,26 @@
 # =============================================================================
-# PAEKA — Dockerfile  (v0.11.9)
+# PAEKA — Dockerfile  (v0.11.10)
 # =============================================================================
-# Changes from v0.11.4:
+# [FIX] CMD previously launched `uvicorn main:app --http httptools ...`
+#       directly, bypassing main.py entirely. That predates this project's
+#       migration to Granian (see main.py / pyproject.toml) and was never
+#       updated to match -- uvicorn is no longer even a direct dependency
+#       (httptools, wsproto, and websockets were all removed alongside it),
+#       so the image failed at startup with ModuleNotFoundError: httptools.
+#       Never caught natively because native runs always go through
+#       `uv run python main.py`, which correctly uses Granian.
 #
-# [FIX-A] Switched uvicorn HTTP implementation from h11 to httptools.
-#
-#         h11 (uvicorn's default) has a hard 65536-byte (64 KB) limit on
-#         individual HTTP header values, and more critically imposes a
-#         DEFAULT_MAX_INCOMPLETE_EVENT_SIZE of 16 KB on the request body
-#         buffer. For multipart file uploads this causes uvicorn to silently
-#         drop the connection mid-upload when the form body exceeds the buffer,
-#         with zero log output — the route handler is never called.
-#
-#         httptools has no such limit and handles large multipart bodies
-#         correctly. It is already installed as part of uvicorn[standard].
-#
-# [FIX-B] Added --timeout-keep-alive 75 to prevent idle connection drops
-#         during long ingestion operations where the client is waiting.
-#
-# [FIX-C] Removed --no-access-log flag so uploads are visible in logs.
-#
-# Everything else unchanged from v0.11.4.
+#       Fix: CMD now runs the same entrypoint native invocations use
+#       (python main.py) instead of a parallel, drift-prone server launch
+#       command. The original concerns that CMD was trying to address --
+#       large multipart uploads not getting silently dropped, idle
+#       connections surviving long ingestion, uploads visible in logs --
+#       are exactly what main.py's _run_server() already needs to handle
+#       correctly today, since native deployments depend on it daily; no
+#       separate flags are needed here to re-solve a problem specific to
+#       uvicorn's h11 implementation, which this image no longer uses.
 # =============================================================================
+
 
 FROM python:3.12-slim AS builder
 
@@ -76,7 +75,6 @@ RUN mkdir -p \
       data/exports \
       data/hf_cache \
       database/sqlite \
-      database/weaviate \
       models \
     && chown -R paeka:paeka /app
 
@@ -93,12 +91,5 @@ HEALTHCHECK --interval=20s --timeout=10s --start-period=180s --retries=10 \
   CMD python3 -c \
     "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"
 
-# FIX-A: --http httptools — handles large multipart uploads correctly
-# FIX-B: --timeout-keep-alive 75 — keeps connection alive during ingestion
-CMD ["uvicorn", "main:app", \
-     "--host",               "0.0.0.0", \
-     "--port",               "8000", \
-     "--workers",            "1", \
-     "--http",               "httptools", \
-     "--timeout-keep-alive", "75", \
-     "--log-level",          "info"]
+# Run the same entrypoint native invocations use -- see header above.
+CMD ["python3", "main.py"]
