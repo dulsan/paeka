@@ -60,6 +60,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       wget \
     && rm -rf /var/lib/apt/lists/*
 
+# [FIX] execute_code (backend/agent/sandbox.py) shells out to `docker run`/
+# `docker info`/`docker kill` -- those didn't exist in this image at all,
+# so the tool only ever worked for native (non-Docker) deployments. The
+# official docker:cli image ships exactly the client binary, nothing else
+# (no dockerd) -- copying it in is far lighter than adding Docker's apt
+# repo + GPG key just for this. paeka-api talks to the daemon over
+# DOCKER_HOST (set in docker-compose.yml, pointed at the docker-socket-
+# proxy sidecar, not the raw socket -- see SETUP_DOCKER.md section 4),
+# so no socket file or group membership is needed here either.
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+
 RUN groupadd -r paeka && useradd -r -g paeka -d /app -s /sbin/nologin paeka
 
 COPY --from=builder /app/.venv /app/.venv
@@ -75,6 +86,7 @@ RUN mkdir -p \
       data/exports \
       data/hf_cache \
       database/sqlite \
+      sandbox_scratch \
       models \
     && chown -R paeka:paeka /app
 

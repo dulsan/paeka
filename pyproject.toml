@@ -47,6 +47,22 @@ dependencies = [
     "qdrant-client>=1.9.0",
 
     # -- Embeddings & reranking --------------------------------------------
+    # [FIX] transformers wasn't pinned anywhere (only pulled in
+    # transitively via sentence-transformers), and uv.lock was gitignored
+    # -- so a clean `uv sync` (e.g. inside the Docker build) was free to
+    # resolve transformers to whatever's newest on PyPI, independently of
+    # whatever happened to be cached in a native .venv. transformers 5.x
+    # rewrote XLMRobertaTokenizer (bge-m3's backbone) to inherit from a new
+    # TokenizersBackend class that dropped prepare_for_model -- confirmed
+    # by diffing 4.57.6 (last v4.x) against 5.12.1 directly. Something in
+    # bge-m3's own loading path still calls that method directly, so every
+    # retrieval call was failing internally and silently falling back to
+    # 0 passages -- the agent kept answering anyway, just ungrounded, with
+    # nothing surfaced to indicate retrieval had broken. sentence-
+    # transformers itself declares transformers<6.0.0,>=4.41.0, so <5
+    # resolves cleanly against it -- confirmed via its own METADATA, not
+    # just trusted.
+    "transformers<5",
     "sentence-transformers>=3.3.0",
     "FlagEmbedding>=1.3.0",
 

@@ -1,0 +1,188 @@
+diff --git a/backend/agent/__init__.py b/backend/agent/__init__.py
+index 17bb59a..f49fb54 100644
+--- a/backend/agent/__init__.py
++++ b/backend/agent/__init__.py
+@@ -1,13 +1,18 @@
+-from backend.agent.graph import AgenticRAGPipeline
+-from backend.agent.tool_graph import SelfHealingToolGraph
+-from backend.agent.iteration_graph import AutonomousIterationGraph
+-from backend.agent.sandbox import CodeSandbox, SandboxResult, get_sandbox
+-from backend.agent.state import AgentState, ToolCallingState, IterationState
++"""
++backend/agent
++=============
++Deliberately empty of re-exports.
+ 
+-__all__ = [
+-    "AgenticRAGPipeline",
+-    "SelfHealingToolGraph",
+-    "AutonomousIterationGraph",
+-    "CodeSandbox", "SandboxResult", "get_sandbox",
+-    "AgentState", "ToolCallingState", "IterationState",
+-]
++[FIX] This used to eagerly import AgenticRAGPipeline (backend.agent.graph)
++at package-init time, which pulls in the entire retrieval/knowledge-graph
++stack (langgraph -> retriever_node -> knowledge.retriever ->
++retrieval.reranker -> torch/FlagEmbedding) just because something did
++`from backend.agent.sandbox import get_sandbox`. Importing *any* submodule
++of this package runs this file first, so the stdlib-only sandbox.py was
++unable to be imported (or unit-tested) without installing the full ML
++stack. Confirmed nothing in the codebase actually used the package-level
++shortcut (`from backend.agent import X`) -- every real caller already
++imports the specific submodule directly (backend.agent.sandbox,
++backend.agent.graph, backend.agent.tool_graph, etc.), so there is no
++re-export to preserve. Import what you need from its own submodule.
++"""
+diff --git a/backend/agent/sandbox.py b/backend/agent/sandbox.py
+index 5cb7ccd..bb9ddc7 100644
+--- a/backend/agent/sandbox.py
++++ b/backend/agent/sandbox.py
+@@ -111,10 +111,25 @@ class CodeSandbox:
+     docker_available:
+         Set False to disable sandbox (raises NotImplementedError on execute).
+         Useful for testing or environments without Docker.
++    memory, cpus, default_timeout:
++        Override the hardcoded per-language defaults in _CONFIGS. None
++        (the default) keeps each language's own default. get_sandbox()
++        passes these from [sandbox] settings (memory_limit, cpu_limit,
++        default_timeout) so PAEKA_SANDBOX__* env vars actually take
++        effect -- previously these settings existed but nothing read them.
+     """
+ 
+-    def __init__(self, docker_available: bool = True) -> None:
++    def __init__(
++        self,
++        docker_available: bool = True,
++        memory: str | None = None,
++        cpus: str | None = None,
++        default_timeout: int | None = None,
++    ) -> None:
+         self._available = docker_available
++        self._memory = memory
++        self._cpus = cpus
++        self._default_timeout = default_timeout
+ 
+     async def execute(
+         self,
+@@ -157,7 +172,9 @@ class CodeSandbox:
+             )
+ 
+         config  = _CONFIGS[language]
+-        t       = timeout or config.timeout
++        memory  = self._memory or config.memory
++        cpus    = self._cpus or config.cpus
++        t       = timeout or self._default_timeout or config.timeout
+         cid     = f"paeka-sandbox-{uuid.uuid4().hex[:8]}"
+ 
+         # Write code to a temporary file on the host, mount into container
+@@ -173,8 +190,8 @@ class CodeSandbox:
+                 "--read-only",
+                 "--cap-drop",        "ALL",
+                 "--security-opt",    "no-new-privileges",
+-                "--memory",          config.memory,
+-                "--cpus",            config.cpus,
++                "--memory",          memory,
++                "--cpus",            cpus,
+                 "--pids-limit",      str(config.pids_limit),
+                 "--tmpfs",           "/tmp:size=64m,noexec",
+                 "--volume",          f"{tmpdir}:/sandbox:ro",
+@@ -269,5 +286,16 @@ _sandbox: CodeSandbox | None = None
+ def get_sandbox() -> CodeSandbox:
+     global _sandbox
+     if _sandbox is None:
+-        _sandbox = CodeSandbox(docker_available=True)
++        # Lazy import: keeps sandbox.py's own top-level imports stdlib-only
++        # (see backend/agent/__init__.py for why that matters), while still
++        # letting the one real caller path -- actually running code --
++        # pick up [sandbox] settings from settings.toml / PAEKA_SANDBOX__*.
++        from backend.shared.config import get_settings
++        cfg = get_settings().sandbox
++        _sandbox = CodeSandbox(
++            docker_available=True,
++            memory=cfg.memory_limit,
++            cpus=cfg.cpu_limit,
++            default_timeout=cfg.default_timeout,
++        )
+     return _sandbox
+diff --git a/backend/api/routes/sandbox.py b/backend/api/routes/sandbox.py
+index 2af7a47..c344000 100644
+--- a/backend/api/routes/sandbox.py
++++ b/backend/api/routes/sandbox.py
+@@ -50,8 +50,8 @@ async def execute_code(
+     """
+     Execute code in an isolated Docker container.
+ 
+-    Security: --network=none, --read-only, --cap-drop=ALL,
+-              --memory=256m, --pids-limit=64, tmpfs /tmp
++    Security: --network=none, --read-only, --cap-drop=ALL, tmpfs /tmp.
++              memory/cpu/pids limits come from [sandbox] settings.
+     """
+     scanner = request.app.state.scanner
+     if scanner:
+@@ -62,7 +62,13 @@ async def execute_code(
+                 detail=f"Code blocked by content security: {scan.findings[0]}",
+             )
+ 
+-    sandbox = get_sandbox()
++    sandbox = getattr(request.app.state, "sandbox", None)
++    if sandbox is None:
++        raise HTTPException(
++            status_code=503,
++            detail="Sandbox is disabled (set [sandbox] enabled = true, or "
++                   "PAEKA_SANDBOX__ENABLED=true).",
++        )
+ 
+     # Check Docker is available before attempting
+     if not await sandbox.is_available():
+@@ -71,10 +77,11 @@ async def execute_code(
+             detail="Docker is not available. Ensure Docker is running on the host.",
+         )
+ 
+-    # [FIX] settings was fetched and never used -- max_timeout below is a
+-    # hardcoded constant, not read from settings. Dead code.
+-    max_timeout = 60   # hard cap regardless of user request
+-    timeout = min(body.timeout or 30, max_timeout)
++    # [FIX] These now actually come from [sandbox] settings (default_timeout,
++    # max_timeout) instead of being hardcoded constants that silently
++    # ignored PAEKA_SANDBOX__DEFAULT_TIMEOUT / PAEKA_SANDBOX__MAX_TIMEOUT.
++    cfg = get_settings().sandbox
++    timeout = min(body.timeout or cfg.default_timeout, cfg.max_timeout)
+ 
+     try:
+         result = await sandbox.execute(
+diff --git a/backend/tools/registry.py b/backend/tools/registry.py
+index 816e18c..aeba707 100644
+--- a/backend/tools/registry.py
++++ b/backend/tools/registry.py
+@@ -76,16 +76,21 @@ def get_registered_tools(request) -> dict[str, ToolFn]:
+     tools["typecheck_code"] = typecheck_code
+ 
+     # ── Sandboxed code execution ──────────────────────────────────────
+-    async def execute_code(code: str, language: str = "python") -> str:
+-        """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
+-        from backend.agent.sandbox import get_sandbox
+-        sandbox = get_sandbox()
+-        if not await sandbox.is_available():
+-            return "Docker sandbox unavailable."
+-        result = await sandbox.execute(code, language=language, timeout=30)
+-        return result.output
+-
+-    tools["execute_code"] = execute_code
++    # [FIX] Was unconditionally calling get_sandbox() regardless of
++    # [sandbox] enabled -- the tool would still work even with the
++    # feature explicitly disabled in settings. Now mirrors the
++    # web_search/retrieve pattern above: only register if app.state
++    # actually has it (set in app.py based on settings.sandbox.enabled).
++    sandbox = getattr(request.app.state, "sandbox", None)
++    if sandbox is not None:
++        async def execute_code(code: str, language: str = "python") -> str:
++            """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
++            if not await sandbox.is_available():
++                return "Docker sandbox unavailable."
++            result = await sandbox.execute(code, language=language, timeout=30)
++            return result.output
++
++        tools["execute_code"] = execute_code
+ 
+     # ── RAG retrieval ──────────────────────────────────────────────────
+     retrieval = getattr(request.app.state, "retrieval", None)

@@ -1,0 +1,677 @@
+diff --git a/.gitignore b/.gitignore
+index f607328..daa2d54 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,7 +11,12 @@ build/
+ 
+ # Virtual environment (UV)
+ .venv/
+-uv.lock
++# [FIX] uv.lock was gitignored, meaning native and Docker builds could
++# (and did) silently resolve different dependency versions from each
++# other -- see the transformers<5 comment in pyproject.toml for the bug
++# that caused. Committing the lockfile is what actually prevents this
++# class of problem recurring; the version pin alone only fixes today's
++# instance of it.
+ 
+ # IDE
+ .vscode/
+diff --git a/Dockerfile b/Dockerfile
+index 4f24866..aa349da 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -60,6 +60,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+       wget \
+     && rm -rf /var/lib/apt/lists/*
+ 
++# [FIX] execute_code (backend/agent/sandbox.py) shells out to `docker run`/
++# `docker info`/`docker kill` -- those didn't exist in this image at all,
++# so the tool only ever worked for native (non-Docker) deployments. The
++# official docker:cli image ships exactly the client binary, nothing else
++# (no dockerd) -- copying it in is far lighter than adding Docker's apt
++# repo + GPG key just for this. paeka-api talks to the daemon over
++# DOCKER_HOST (set in docker-compose.yml, pointed at the docker-socket-
++# proxy sidecar, not the raw socket -- see SETUP_DOCKER.md section 4),
++# so no socket file or group membership is needed here either.
++COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
++
+ RUN groupadd -r paeka && useradd -r -g paeka -d /app -s /sbin/nologin paeka
+ 
+ COPY --from=builder /app/.venv /app/.venv
+@@ -75,6 +86,7 @@ RUN mkdir -p \
+       data/exports \
+       data/hf_cache \
+       database/sqlite \
++      sandbox_scratch \
+       models \
+     && chown -R paeka:paeka /app
+ 
+diff --git a/SETUP_DOCKER.md b/SETUP_DOCKER.md
+index 1356368..75e49a4 100644
+--- a/SETUP_DOCKER.md
++++ b/SETUP_DOCKER.md
+@@ -154,27 +154,108 @@ docker run --rm -v paeka_database:/data -v "$(pwd)":/backup busybox \
+   tar czf /backup/paeka-db-backup.tar.gz -C / data
+ ```
+ 
+-## 4. Code execution sandbox (`execute_code`) — opt-in, not wired up by default
++## 4. Code execution sandbox (`execute_code`)
++
++The `execute_code` tool shells out to `docker run` -- when `paeka-api` runs
++inside this compose stack, it needs a way to reach a Docker daemon at all,
++plus (ideally) a hardened runtime so sandboxed code doesn't share the host
++kernel. Two independent pieces, both already wired into this compose file:
++
++### 4a. Reaching Docker at all -- via a socket proxy, not a raw mount
++
++Mounting `/var/run/docker.sock` straight into `paeka-api` would work, but
++it's effectively root-equivalent access to your host for *any* process
++running in that container -- not a trade-off to make implicitly. Instead,
++`docker-socket-proxy` holds the real socket, and only exposes a narrow
++slice of the Docker API to `paeka-api` over the internal network
++(`DOCKER_HOST=tcp://docker-socket-proxy:2375`): create/start containers,
++pull the python/alpine/node sandbox images, and `docker info`. Everything
++else -- `exec` into arbitrary containers, touching volumes/networks
++directly, building images from an arbitrary Dockerfile, swarm, secrets --
++stays off. See the `docker-socket-proxy` service definition in
++`docker-compose.yml` for the exact list and why each one is on/off.
++
++Honest caveat: this filters by API *category*, not by deep-inspecting the
++JSON body of a container-create call -- a real, meaningful narrowing, not
++a perfect one. If `paeka-api` were ever compromised, the proxy limits what
++it could do; it doesn't guarantee a create-call can't request something
++within an allowed category that's more than intended.
++
++This is on by default and needs nothing further from you -- `docker
++compose up -d --build` brings up the proxy alongside everything else.
++
++### 4b. The named-volume detail (already handled, just so you know why)
++
++`paeka-api`'s own filesystem isn't the real Docker host's filesystem.
++Writing a sandbox script to a plain tempdir inside `paeka-api` and asking
++the daemon (via the proxy) to bind-mount that path into a sibling
++container wouldn't work -- the daemon resolves that path against the
++actual host, not against `paeka-api`'s container, and finds nothing
++there. The fix is a Docker *named volume* (`paeka_sandbox_scratch`,
++declared in `docker-compose.yml`'s top-level `volumes:`), mounted into
++`paeka-api` and referenced *by name* in the sibling container's mount --
++resolved by the daemon itself, identically regardless of host OS or path
++translation. `PAEKA_SANDBOX__SCRATCH_DIR`/`PAEKA_SANDBOX__SCRATCH_VOLUME`
++in `paeka-api`'s environment point at this; you shouldn't need to touch
++either. See `backend/agent/sandbox.py`'s module docstring for the full
++explanation.
++
++### 4c. Hardened runtime (gVisor / Kata) -- optional, but recommended
++
++By default, sandboxed code still runs on Docker's plain `runc` runtime --
++every hardening flag (`--network none`, `--cap-drop ALL`, etc.) still
++shares the host kernel with everything else, so a kernel-level
++container-escape bug defeats all of them at once. `paeka-api` will
++automatically prefer a hardened runtime the moment one is registered with
++the Docker engine -- no compose or code changes needed, just install one
++of the following and restart `paeka-api`.
++
++**gVisor (`runsc`)** -- userspace-reimplemented syscall surface, no VM,
++no nested virtualization needed. Run this inside your WSL2 distro (or
++wherever the headless Engine actually lives, not via Docker Desktop):
+ 
+-The `execute_code` tool shells out to `docker run` on the host. Giving the
+-`paeka-api` container that ability means mounting the host's Docker socket
+-into it — which is effectively root-equivalent access to your host,
+-regardless of any rootless settings elsewhere. That's a real trade-off,
+-not a formality, so it's left off by default (matching the
+-`docker_available=False` state you already saw in your test run).
++```bash
++# 1. Dependencies for adding a new apt repo over HTTPS
++sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
++
++# 2. Add gVisor's apt repo + signing key
++curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
++echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
++  sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
++
++# 3. Install runsc
++sudo apt-get update && sudo apt-get install -y runsc
+ 
+-If you want it anyway:
++# 4. Register it as a Docker runtime and restart the daemon
++sudo runsc install
++sudo systemctl restart docker     # or: systemctl --user restart docker (rootless engine)
+ 
+-```yaml
+-# add to the paeka-api service in docker-compose.yml
+-    volumes:
+-      - /var/run/docker.sock:/var/run/docker.sock   # add this line
++# 5. Verify it actually works before touching PAEKA at all
++docker run --rm --runtime=runsc hello-world
++docker info --format '{{json .Runtimes}}'   # should now list "runsc"
+ ```
+ 
+-...and add `docker-ce-cli` to the runtime stage of the Dockerfile (the
+-`docker` Python-side code shells out to the `docker` *binary*, not the
+-SDK). Sibling containers spawned this way run alongside `paeka-api`, not
+-nested inside it — no Docker-in-Docker daemon needed.
++If step 5's `hello-world` run fails with something cgroups-related
++(common on systemd-based distros, including current WSL2 Ubuntu images
++with systemd enabled), add `"exec-opts": ["native.cgroupdriver=cgroupfs"]`
++to `/etc/docker/daemon.json` alongside the `runsc` entry `runsc install`
++already added, then restart the daemon again.
++
++Once that verification step passes, just restart `paeka-api`
++(`docker compose up -d paeka-api`) -- it'll detect `runsc` on its own and
++start using it for every sandboxed execution from then on. Check the logs
++for `Sandbox: using hardened runtime 'runsc'` to confirm.
++
++**Kata Containers** (genuine microVM -- separate kernel per execution,
++stronger than gVisor, more setup) is a further optional upgrade later if
++you want it: `preferred_runtimes` already lists `kata-clh`/`kata` ahead of
++`runsc`, so installing and registering it will make `paeka-api` prefer it
++automatically the next time it starts, no further changes here. WSL2's
++2026 kernels ship KVM as a loadable module (one `.wslconfig` setting,
++already the default on Windows 11), which is what makes this realistically
++viable now where it wasn't a couple of years ago -- not covered step-by-
++step here since it's a heavier lift than gVisor; ask if you want to go
++that route and it's worth its own walkthrough.
+ 
+ ## Troubleshooting
+ 
+@@ -186,3 +267,6 @@ nested inside it — no Docker-in-Docker daemon needed.
+ | `paeka-ollama-init` exits non-zero | Check `models/qwen/Qwen3.5-9B-Q4_K_M.gguf` actually exists on the host — it's gitignored and not committed, so a fresh clone won't have it |
+ | `could not select device driver` | NVIDIA Container Toolkit not installed/configured for this daemon, or you restarted the wrong daemon (rootless vs system) after `nvidia-ctk runtime configure`. **On Docker Desktop**, skip the toolkit install entirely — enable Settings → Resources → GPU support instead, and make sure it's the Windows-side NVIDIA driver installed, not a WSL-internal one. |
+ | API can't reach Ollama/Qdrant | Confirm you're not also running the native `qdrant.exe` / `ollama serve` on the same ports — `127.0.0.1:6333` published by compose will conflict with anything already bound there |
++| `Sandbox status` still shows `docker_available: false` after `docker compose up` | Check `docker compose logs docker-socket-proxy` for startup errors first, then `docker compose logs paeka-api \| grep -i sandbox`. If the proxy container isn't `Up` at all, `paeka-api` started before it was ready -- `docker compose restart paeka-api` once the proxy is confirmed running. |
++| `execute_code` returns a Docker API error mentioning permission/forbidden, but `docker_available: true` | The socket-proxy is reachable but denied a specific call -- check it isn't trying to do something outside the allowed categories (see 4a). Re-check `docker compose logs docker-socket-proxy` for which endpoint got rejected. |
++| Sandbox runs fine but `Sandbox: using hardened runtime` never appears in `paeka-api` logs | Neither gVisor nor Kata is registered with this Docker engine yet -- expected until you follow section 4c. Not an error; sandboxed code still runs, just on the default runtime. |
+diff --git a/backend/agent/sandbox.py b/backend/agent/sandbox.py
+index bb9ddc7..a2036d7 100644
+--- a/backend/agent/sandbox.py
++++ b/backend/agent/sandbox.py
+@@ -11,26 +11,51 @@ Security model (defence-in-depth):
+   --memory / --cpus       resource hard limits
+   --pids-limit            prevent fork bombs
+   tmpfs /tmp              writable scratch space, in-memory only
+-
+-Why Docker over Firecracker:
+-  Firecracker requires KVM access on the host, which is unavailable
+-  inside Docker (our own containers) without --privileged, negating
+-  the security benefit. For a single-user self-hosted system, hardened
+-  Docker containers (all caps dropped, no network, read-only FS) provide
+-  strong practical isolation without needing a microVM control plane.
+-  The community consensus is: Firecracker for multi-tenant cloud,
+-  hardened Docker for single-user/trusted environments.
++  --runtime               hardened runtime if one is registered with the
++                           Docker engine (gVisor's runsc, or Kata
++                           Containers' kata/kata-clh) -- tried in
++                           [sandbox].preferred_runtimes order, falls back
++                           to the default kernel-sharing runtime with a
++                           logged warning if none are installed. See
++                           SETUP_DOCKER.md section 4 for install steps.
++
++[FIX] Previously *only* ever ran on the default runc runtime -- every
++flag above hardens the container, but all of them still share the host
++kernel with every other process, so a kernel-level container-escape
++bug defeats all of them at once. gVisor/Kata close that specific gap:
++gVisor re-implements the syscall surface in userspace so sandboxed
++code never talks to the real kernel; Kata gives each execution its own
++kernel via hardware virtualization (a real microVM). Neither is
++required -- the sandbox still runs fine on the plain runtime, just
++with a weaker boundary -- installing one is a host-level config change,
++not a code change here.
++
++[FIX] scratch_dir / scratch_volume: when paeka-api itself runs inside
++Docker Compose (sibling containers via the Docker socket -- see
++SETUP_DOCKER.md section 4), its own filesystem isn't the real Docker
++host's filesystem. A plain tempfile.TemporaryDirectory() path can't be
++bind-mounted into the sandbox container in that setup, because the
++daemon resolves that path against the actual host, not against
++paeka-api's own container, and finds nothing there. Setting both of
++these together switches to writing scripts into a Docker *named
++volume* instead, referenced by name (not path) -- resolved by the
++daemon itself, identically regardless of host OS or path translation.
++Leaving both unset (the default) keeps the simpler, original behaviour
++for native deployments, where this problem doesn't exist.
+ 
+ Supported languages:
+-  Python   → python:3.12-slim image
+-  Bash     → alpine image
++  Python   -> python:3.12-slim image
++  Bash     -> alpine image
++  Node     -> node:20-alpine image
+   (extensible via SandboxConfig)
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
++import json
+ import logging
++import shutil
+ import tempfile
+ import uuid
+ from dataclasses import dataclass, field
+@@ -49,7 +74,10 @@ _DEFAULT_PIDS    = 64       # max processes inside container
+ class SandboxConfig:
+     """Per-language sandbox configuration."""
+     image: str
+-    run_cmd: list[str]      # command to execute the script (without the script path)
++    run_cmd: list[str]      # interpreter command only -- the resolved
++                             # script path is appended at call time, since
++                             # it differs between the native tempdir path
++                             # and the named-volume (DooD) path
+     file_ext: str           # source file extension
+     memory: str     = _DEFAULT_MEMORY
+     cpus: str       = _DEFAULT_CPUS
+@@ -83,17 +111,17 @@ class SandboxResult:
+ _CONFIGS: dict[str, SandboxConfig] = {
+     "python": SandboxConfig(
+         image="python:3.12-slim",
+-        run_cmd=["python3", "/sandbox/script.py"],
++        run_cmd=["python3"],
+         file_ext=".py",
+     ),
+     "bash": SandboxConfig(
+         image="alpine:latest",
+-        run_cmd=["sh", "/sandbox/script.sh"],
++        run_cmd=["sh"],
+         file_ext=".sh",
+     ),
+     "javascript": SandboxConfig(
+         image="node:20-alpine",
+-        run_cmd=["node", "/sandbox/script.js"],
++        run_cmd=["node"],
+         file_ext=".js",
+     ),
+ }
+@@ -117,6 +145,16 @@ class CodeSandbox:
+         passes these from [sandbox] settings (memory_limit, cpu_limit,
+         default_timeout) so PAEKA_SANDBOX__* env vars actually take
+         effect -- previously these settings existed but nothing read them.
++    scratch_dir, scratch_volume:
++        Set both together to use the named-volume path (for paeka-api
++        running inside Docker Compose -- see module docstring). Leave
++        both None (the default) for native deployments.
++    preferred_runtimes:
++        Hardened Docker runtimes to try, in order, e.g. ["kata-clh",
++        "kata", "runsc"]. The first one actually registered with this
++        Docker engine wins; none registered falls back to the default
++        runtime with a logged warning. Checked once and cached for the
++        life of this instance.
+     """
+ 
+     def __init__(
+@@ -125,11 +163,19 @@ class CodeSandbox:
+         memory: str | None = None,
+         cpus: str | None = None,
+         default_timeout: int | None = None,
++        scratch_dir: str | None = None,
++        scratch_volume: str | None = None,
++        preferred_runtimes: list[str] | None = None,
+     ) -> None:
+         self._available = docker_available
+         self._memory = memory
+         self._cpus = cpus
+         self._default_timeout = default_timeout
++        self._scratch_dir = scratch_dir
++        self._scratch_volume = scratch_volume
++        self._preferred_runtimes = preferred_runtimes or []
++        self._runtime_checked = False
++        self._resolved_runtime: str | None = None
+ 
+     async def execute(
+         self,
+@@ -171,40 +217,123 @@ class CodeSandbox:
+                 f"Supported: {sorted(_CONFIGS.keys())}"
+             )
+ 
+-        config  = _CONFIGS[language]
+-        memory  = self._memory or config.memory
+-        cpus    = self._cpus or config.cpus
+-        t       = timeout or self._default_timeout or config.timeout
+-        cid     = f"paeka-sandbox-{uuid.uuid4().hex[:8]}"
++        config   = _CONFIGS[language]
++        memory   = self._memory or config.memory
++        cpus     = self._cpus or config.cpus
++        t        = timeout or self._default_timeout or config.timeout
++        cid      = f"paeka-sandbox-{uuid.uuid4().hex[:8]}"
++        runtime  = await self._detect_runtime()
++
++        if self._scratch_dir and self._scratch_volume:
++            # Sibling-container-safe path -- see module docstring. Each
++            # execution gets its own subdirectory so concurrent runs
++            # don't see each other's scripts, explicitly removed in the
++            # finally block once the container has exited (the volume
++            # itself is long-lived and shared, unlike a TemporaryDirectory).
++            run_id  = uuid.uuid4().hex[:12]
++            run_dir = Path(self._scratch_dir) / run_id
++            run_dir.mkdir(parents=True, exist_ok=True)
++            try:
++                (run_dir / f"script{config.file_ext}").write_text(code, encoding="utf-8")
++                volume_arg    = f"{self._scratch_volume}:/sandbox:ro"
++                script_in_box = f"/sandbox/{run_id}/script{config.file_ext}"
++                return await self._run_in_container(
++                    volume_arg, script_in_box, config, memory, cpus, cid, runtime, t,
++                )
++            finally:
++                shutil.rmtree(run_dir, ignore_errors=True)
+ 
+-        # Write code to a temporary file on the host, mount into container
++        # Native deployment: paeka-api's own tempdir *is* the real host
++        # filesystem, so the simple bind-mount-by-path approach just works.
+         with tempfile.TemporaryDirectory(prefix="paeka_sandbox_") as tmpdir:
+-            script_path = Path(tmpdir) / f"script{config.file_ext}"
+-            script_path.write_text(code, encoding="utf-8")
+-
+-            docker_cmd = [
+-                "docker", "run",
+-                "--rm",
+-                "--name",            cid,
+-                "--network",         "none",
+-                "--read-only",
+-                "--cap-drop",        "ALL",
+-                "--security-opt",    "no-new-privileges",
+-                "--memory",          memory,
+-                "--cpus",            cpus,
+-                "--pids-limit",      str(config.pids_limit),
+-                "--tmpfs",           "/tmp:size=64m,noexec",
+-                "--volume",          f"{tmpdir}:/sandbox:ro",
+-                "--workdir",         "/sandbox",
+-            ]
+-
+-            # Inject environment variables
+-            for k, v in config.env.items():
+-                docker_cmd += ["--env", f"{k}={v}"]
+-
+-            docker_cmd += [config.image] + config.run_cmd
+-
+-            return await self._run_docker(docker_cmd, cid, t)
++            (Path(tmpdir) / f"script{config.file_ext}").write_text(code, encoding="utf-8")
++            volume_arg    = f"{tmpdir}:/sandbox:ro"
++            script_in_box = f"/sandbox/script{config.file_ext}"
++            return await self._run_in_container(
++                volume_arg, script_in_box, config, memory, cpus, cid, runtime, t,
++            )
++
++    async def _run_in_container(
++        self,
++        volume_arg: str,
++        script_in_box: str,
++        config: SandboxConfig,
++        memory: str,
++        cpus: str,
++        cid: str,
++        runtime: str | None,
++        timeout: int,
++    ) -> SandboxResult:
++        docker_cmd = [
++            "docker", "run",
++            "--rm",
++            "--name",            cid,
++            "--network",         "none",
++            "--read-only",
++            "--cap-drop",        "ALL",
++            "--security-opt",    "no-new-privileges",
++            "--memory",          memory,
++            "--cpus",            cpus,
++            "--pids-limit",      str(config.pids_limit),
++            "--tmpfs",           "/tmp:size=64m,noexec",
++            "--volume",          volume_arg,
++            "--workdir",         "/sandbox",
++        ]
++
++        if runtime:
++            docker_cmd += ["--runtime", runtime]
++
++        # Inject environment variables
++        for k, v in config.env.items():
++            docker_cmd += ["--env", f"{k}={v}"]
++
++        docker_cmd += [config.image] + config.run_cmd + [script_in_box]
++
++        return await self._run_docker(docker_cmd, cid, timeout)
++
++    async def _detect_runtime(self) -> str | None:
++        """
++        Return the first of self._preferred_runtimes actually registered
++        with this Docker engine, or None if none are (caller falls back
++        to the default runtime). Checked once and cached -- if you
++        install gVisor/Kata after paeka-api has started, restart it to
++        pick that up.
++        """
++        if self._runtime_checked:
++            return self._resolved_runtime
++        self._runtime_checked = True
++
++        if not self._preferred_runtimes:
++            return None
++
++        try:
++            proc = await asyncio.create_subprocess_exec(
++                "docker", "info", "--format", "{{json .Runtimes}}",
++                stdout=asyncio.subprocess.PIPE,
++                stderr=asyncio.subprocess.DEVNULL,
++            )
++            stdout_b, _ = await proc.communicate()
++            if proc.returncode != 0:
++                return None
++            registered = json.loads(stdout_b.decode("utf-8", errors="replace") or "{}")
++        except (FileNotFoundError, ValueError, OSError):
++            return None
++
++        for name in self._preferred_runtimes:
++            if name in registered:
++                self._resolved_runtime = name
++                logger.info("Sandbox: using hardened runtime %r for code execution.", name)
++                return name
++
++        logger.warning(
++            "Sandbox: none of the preferred hardened runtimes %s are "
++            "registered with this Docker engine -- falling back to the "
++            "default runtime (shares the host kernel; weaker isolation "
++            "against malicious code). See SETUP_DOCKER.md section 4 to "
++            "install gVisor or Kata Containers.",
++            self._preferred_runtimes,
++        )
++        return None
+ 
+     async def is_available(self) -> bool:
+         """Return True if Docker daemon is reachable."""
+@@ -297,5 +426,8 @@ def get_sandbox() -> CodeSandbox:
+             memory=cfg.memory_limit,
+             cpus=cfg.cpu_limit,
+             default_timeout=cfg.default_timeout,
++            scratch_dir=cfg.scratch_dir,
++            scratch_volume=cfg.scratch_volume,
++            preferred_runtimes=cfg.preferred_runtimes,
+         )
+     return _sandbox
+diff --git a/backend/shared/config.py b/backend/shared/config.py
+index 913dad1..d927a17 100644
+--- a/backend/shared/config.py
++++ b/backend/shared/config.py
+@@ -134,6 +134,23 @@ class SandboxSettings(BaseModel):
+     max_timeout: int = 60
+     memory_limit: str = "256m"
+     cpu_limit: str = "1.0"
++    # [FIX] Set both together when paeka-api runs inside Docker Compose
++    # (sibling containers via the Docker socket) -- see SETUP_DOCKER.md
++    # section 4. scratch_dir is the in-container path where paeka-api
++    # mounted the named volume; scratch_volume is that volume's name,
++    # referenced by name (not path) when mounting into the sandbox
++    # container. Leave both None for native deployments (the default) --
++    # see backend/agent/sandbox.py's module docstring for why.
++    scratch_dir: str | None = None
++    scratch_volume: str | None = None
++    # [FIX] Hardened Docker runtimes to try, in order. The first one
++    # actually registered with this Docker engine wins; none registered
++    # falls back to the default (kernel-sharing, weaker) runtime with a
++    # logged warning -- never a hard failure. See SETUP_DOCKER.md
++    # section 4 for gVisor/Kata install instructions.
++    preferred_runtimes: list[str] = Field(
++        default_factory=lambda: ["kata-clh", "kata", "runsc"]
++    )
+ 
+ 
+ class IterationSettings(BaseModel):
+diff --git a/docker-compose.yml b/docker-compose.yml
+index bd7c508..885e92f 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -11,11 +11,20 @@
+ #                      `ollama serve` + manual `ollama create`)
+ #   paeka-api          The FastAPI app itself (this repo's Dockerfile)
+ #
+-# Plus one short-lived helper:
++# Plus two short-lived/sidecar helpers:
+ #   paeka-ollama-init  Runs `ollama create paeka-qwen -f Modelfile` once
+ #                      paeka-ollama is up, then exits. Re-runs (cheaply,
+ #                      idempotently) on every `up` so Modelfile edits are
+ #                      always picked up.
++#   docker-socket-proxy
++#                      Holds the *real* Docker socket so paeka-api never
++#                      has to. paeka-api talks to this over the internal
++#                      network instead -- it only exposes the narrow
++#                      slice of the Docker API the sandbox (execute_code)
++#                      actually needs (create/start containers, pull
++#                      images, docker info), nothing else. See
++#                      SETUP_DOCKER.md section 4 for the full rationale
++#                      and the gVisor/Kata install steps that go with it.
+ #
+ # Rootless / no-Docker-Desktop notes (can't be set from this file alone --
+ # see SETUP_DOCKER.md):
+@@ -47,6 +56,56 @@
+ # =============================================================================
+ 
+ services:
++  # Holds the real Docker socket so paeka-api never has to (see header
++  # comment + SETUP_DOCKER.md section 4). Internal-network-only on
++  # purpose -- no ports: block, nothing outside this compose stack can
++  # reach it.
++  docker-socket-proxy:
++    image: tecnativa/docker-socket-proxy:latest
++    container_name: paeka-docker-socket-proxy
++    restart: unless-stopped
++    environment:
++      # Everything in this image defaults to 0 (deny) except a few
++      # harmless info endpoints. Only turning on the narrow slice the
++      # sandbox actually uses -- POST is a blanket write-toggle, still
++      # scoped per-category below it, so POST+CONTAINERS+IMAGES together
++      # means "may create/start containers and pull images", nothing more.
++      CONTAINERS: "1"     # create/start/stop/remove containers, inspect
++      IMAGES: "1"          # pull/inspect the python/alpine/node sandbox images
++      INFO: "1"            # `docker info` -- is_available() + runtime detection
++      POST: "1"
++      # Explicitly off: each of these is a real privilege-escalation path
++      # if left open to a process that might get compromised. EXEC alone
++      # would let a compromised paeka-api run arbitrary commands inside
++      # *any* running container, e.g. paeka-qdrant/paeka-ollama.
++      EXEC: "0"
++      VOLUMES: "0"         # sandbox_scratch is referenced by name inside a
++                            # CONTAINERS create call, not via the /volumes API
++      NETWORKS: "0"
++      SWARM: "0"
++      SERVICES: "0"
++      TASKS: "0"
++      NODES: "0"
++      PLUGINS: "0"
++      BUILD: "0"           # separate gate from IMAGES -- building from an
++                            # arbitrary Dockerfile is its own risk category
++      COMMIT: "0"          # separate gate from CONTAINERS -- snapshotting a
++                            # running container into a new image
++      SECRETS: "0"
++      CONFIGS: "0"
++      DISTRIBUTION: "0"
++      AUTH: "0"
++      SESSION: "0"
++    volumes:
++      - /var/run/docker.sock:/var/run/docker.sock:ro
++    # No healthcheck here -- this image is Alpine/HAProxy-based and I'm
++    # not confident it ships a shell capable of the bash /dev/tcp trick
++    # used for paeka-qdrant below, and would rather skip a healthcheck
++    # than ship one I can't verify actually passes. depends_on below
++    # only waits for the process to start, not for it to be ready --
++    # if paeka-api logs connection-refused on its first sandbox check,
++    # that's why; it should resolve on the next health probe.
++
+   paeka-qdrant:
+     image: qdrant/qdrant:v1.18.2-unprivileged
+     container_name: paeka-qdrant
+@@ -134,6 +193,8 @@ services:
+         condition: service_healthy
+       paeka-ollama-init:
+         condition: service_completed_successfully
++      docker-socket-proxy:
++        condition: service_started
+     env_file:
+       - .env
+     environment:
+@@ -141,10 +202,26 @@ services:
+       # (security, HF hub, OTEL, etc.) still applies as-is.
+       PAEKA_LLM__BASE_URL: "http://paeka-ollama:11434/v1"
+       PAEKA_RETRIEVAL__QDRANT_URL: "http://paeka-qdrant:6333"
++      # [FIX] execute_code had no way to reach a Docker daemon at all
++      # from inside this container -- see SETUP_DOCKER.md section 4.
++      # DOCKER_HOST points the `docker` CLI at the socket-proxy sidecar
++      # (a scoped slice of the real API), never at a raw socket mounted
++      # directly into this container.
++      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
++      # Paired with the sandbox_scratch volume below: lets the sandbox
++      # write scripts somewhere a *sibling* container (spun up via the
++      # proxy, not a child of this one) can actually see -- this
++      # container's own /tmp isn't visible to the real Docker host.
++      # Referenced by volume *name* (pinned below), not path -- works
++      # the same on Windows/WSL2/Linux. See backend/agent/sandbox.py's
++      # module docstring for why this is necessary at all.
++      PAEKA_SANDBOX__SCRATCH_DIR: "/app/sandbox_scratch"
++      PAEKA_SANDBOX__SCRATCH_VOLUME: "paeka_sandbox_scratch"
+     volumes:
+       - paeka_data:/app/data
+       - paeka_database:/app/database
+       - ./models:/app/models:ro
++      - sandbox_scratch:/app/sandbox_scratch
+     ports:
+       - "8000:8000"
+ 
+@@ -153,3 +230,16 @@ volumes:
+   ollama_data:
+   paeka_data:
+   paeka_database:
++  # Name pinned explicitly rather than left to Compose's default
++  # <project>_<volume> prefixing -- the sibling `docker run -v
++  # NAME:/sandbox:ro` call in backend/agent/sandbox.py is a raw Docker
++  # CLI invocation, outside Compose entirely, so it needs the *exact*
++  # on-engine name. If this were left unpinned and ever drifted from
++  # PAEKA_SANDBOX__SCRATCH_VOLUME above (e.g. someone renames this
++  # project's directory, which changes Compose's default prefix), the
++  # mismatch wouldn't error -- Docker auto-creates a volume that doesn't
++  # exist yet, so the sandbox would silently start writing into a fresh,
++  # disconnected, empty volume instead. Pinning the name removes that
++  # failure mode entirely.
++  sandbox_scratch:
++    name: paeka_sandbox_scratch
+diff --git a/pyproject.toml b/pyproject.toml
+index f8e9264..2363580 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -47,6 +47,22 @@ dependencies = [
+     "qdrant-client>=1.9.0",
+ 
+     # -- Embeddings & reranking --------------------------------------------
++    # [FIX] transformers wasn't pinned anywhere (only pulled in
++    # transitively via sentence-transformers), and uv.lock was gitignored
++    # -- so a clean `uv sync` (e.g. inside the Docker build) was free to
++    # resolve transformers to whatever's newest on PyPI, independently of
++    # whatever happened to be cached in a native .venv. transformers 5.x
++    # rewrote XLMRobertaTokenizer (bge-m3's backbone) to inherit from a new
++    # TokenizersBackend class that dropped prepare_for_model -- confirmed
++    # by diffing 4.57.6 (last v4.x) against 5.12.1 directly. Something in
++    # bge-m3's own loading path still calls that method directly, so every
++    # retrieval call was failing internally and silently falling back to
++    # 0 passages -- the agent kept answering anyway, just ungrounded, with
++    # nothing surfaced to indicate retrieval had broken. sentence-
++    # transformers itself declares transformers<6.0.0,>=4.41.0, so <5
++    # resolves cleanly against it -- confirmed via its own METADATA, not
++    # just trusted.
++    "transformers<5",
+     "sentence-transformers>=3.3.0",
+     "FlagEmbedding>=1.3.0",
+ 

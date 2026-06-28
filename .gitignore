@@ -11,7 +11,12 @@ build/
 
 # Virtual environment (UV)
 .venv/
-uv.lock
+# [FIX] uv.lock was gitignored, meaning native and Docker builds could
+# (and did) silently resolve different dependency versions from each
+# other -- see the transformers<5 comment in pyproject.toml for the bug
+# that caused. Committing the lockfile is what actually prevents this
+# class of problem recurring; the version pin alone only fixes today's
+# instance of it.
 
 # IDE
 .vscode/

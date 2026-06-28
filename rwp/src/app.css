@@ -1,0 +1,65 @@
+/*
+ * Design direction: "reading room" -- this is a research tool for
+ * people who spend their day reading dense text, not a consumer
+ * messaging app. Deliberately avoiding chat-bubble conventions (they
+ * read as mobile-messaging-app, not research-instrument) in favor of
+ * a manuscript-annotation feel: role is marked by a thin coloured
+ * rule + label, like marginalia in two inks, rather than coloured
+ * bubble shapes. Serif for content people are meant to read closely;
+ * sans for UI chrome they just need to operate.
+ */
+:root {
+  --color-paper: #f2efe8;
+  --color-paper-raised: #fbfaf6;
+  --color-ink: #1b2430;
+  --color-ink-soft: #5a6270;
+  --color-rule: #d8d2c2;
+  --color-accent-user: #4f6b52;
+  --color-accent-assistant: #6f5e84;
+  --color-error: #a8472f;
+  --color-error-bg: #f6e8e3;
+
+  --font-content: ui-serif, Georgia, "Source Serif Pro", serif;
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  --radius: 3px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-ui);
+}
+
+#app {
+  height: 100vh;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent-user);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

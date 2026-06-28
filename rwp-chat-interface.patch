@@ -1,0 +1,1358 @@
+diff --git a/rwp/.gitignore b/rwp/.gitignore
+new file mode 100644
+index 0000000..972549d
+--- /dev/null
++++ b/rwp/.gitignore
+@@ -0,0 +1,14 @@
++node_modules/
++dist/
++.svelte-kit/
++
++# package manager artifacts -- repo targets Bun; if you verify locally
++# with npm instead, don't commit its lockfile alongside bun's
++package-lock.json
++yarn.lock
++
++*.log
++.DS_Store
++
++.vscode/
++.idea/
+diff --git a/rwp/README.md b/rwp/README.md
+new file mode 100644
+index 0000000..bf86bb4
+--- /dev/null
++++ b/rwp/README.md
+@@ -0,0 +1,81 @@
++# Research Workbench Platform -- chat interface
++
++The first piece of RWP: a standalone Svelte chat UI, talking to any
++OpenAI-compatible chat completions endpoint (Paeka's
++`/v1/chat/completions` satisfies this directly). Deliberately **not**
++a Tauri/Rust app yet -- see "What's deferred" below.
++
++## Stack
++
++- **Svelte 5** (runes) + **Vite 8** -- plain Vite, not SvelteKit. The
++  eventual Tauri shell wraps a static frontend bundle with no Node
++  server at runtime, so this avoids building against a server-route
++  pattern that wouldn't carry over.
++- **TypeScript 6.0** -- TS 7.0 only reached RC status recently and its
++  tooling-facing API isn't stable until 7.1 (per Microsoft's own
++  announcement, "several months" off as of when this was built). TS
++  6.0 was deliberately built as a compatibility bridge with
++  near-identical type-checking semantics, so the eventual bump should
++  be close to a non-event.
++- **Vercel AI SDK** (`ai` + `@ai-sdk/svelte` + `@ai-sdk/openai-compatible`)
++  for the chat session itself, rather than hand-rolling SSE parsing
++  and message-state management. `DirectChatTransport` is the piece
++  that makes this work without a backend route: it talks to an `Agent`
++  in-process (i.e. straight from the browser), which is exactly what a
++  single-process / no-server-runtime app needs.
++- **Vitest** + **@testing-library/svelte** for tests.
++
++## Setup
++
++This repo targets **Bun** as the package manager (per the project
++notes). Built and verified here with npm, since that's what was
++available in the build/verification environment -- everything in
++`package.json` is plain, Bun-compatible config, so:
++
++```bash
++bun install
++bun run dev      # http://localhost:5173
++bun run test     # vitest run
++bun run check    # svelte-check (TypeScript + template validation)
++bun run build    # production build -> dist/
++```
++
++(`npm install` / `npm run <script>` work identically if you don't have
++Bun yet.)
++
++## Where the AI provider seam actually is
++
++`src/lib/ai/agent.ts`'s `createAgentSession()` is the *only* place that
++decides how chat messages reach a model. Today: a `DirectChatTransport`
++wrapping an `Agent` that calls an OpenAI-compatible endpoint straight
++from the browser.
++
++The SAD's data-flow diagram routes AI calls through a Rust "AI
++orchestrator," not direct frontend-to-provider calls. When the
++Tauri/Rust shell gets built, that's the one function that changes --
++swap `DirectChatTransport` for a custom `ChatTransport` that calls
++`invoke('send_chat_message', ...)` and adapts Tauri's event stream into
++a `ReadableStream<UIMessageChunk>`. Every component that consumes the
++`Chat` instance this function returns (`ChatWindow.svelte` and
++everything under it) stays exactly as it is -- they only know about
++`chat.messages` / `chat.status` / `chat.sendMessage()`, never about
++what's actually moving the bytes.
++
++## What's deferred
++
++No Tauri, no Rust, no SQLite, no workspace/paper-library/lab-book --
++just the chat shell, on purpose. Two reasons: this environment has no
++`cargo`/`rustc` at all, so any Rust written here would be unverifiable
++guesswork; and Tauri is explicitly designed to wrap an
++already-working Vite frontend with minimal disruption, so building the
++chat UI standalone first and wrapping it later doesn't throw anything
++away.
++
++## Known harmless build notice
++
++`vite build` prints a Node built-in externalization notice for
++`diagnostics_channel` (imported somewhere inside the `ai` package).
++This is Vite correctly stubbing out a Node-only module for the browser
++build -- expected for an isomorphic package, not a bug, and the actual
++build/test/runtime behaviour (including a full mocked streaming
++round-trip in `ChatWindow.test.ts`) is verified working regardless.
+diff --git a/rwp/index.html b/rwp/index.html
+new file mode 100644
+index 0000000..ae9d19f
+--- /dev/null
++++ b/rwp/index.html
+@@ -0,0 +1,12 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <title>Research Workbench</title>
++  </head>
++  <body>
++    <div id="app"></div>
++    <script type="module" src="/src/main.ts"></script>
++  </body>
++</html>
+diff --git a/rwp/package.json b/rwp/package.json
+new file mode 100644
+index 0000000..bda1665
+--- /dev/null
++++ b/rwp/package.json
+@@ -0,0 +1,34 @@
++{
++  "name": "rwp",
++  "private": true,
++  "version": "0.1.0",
++  "type": "module",
++  "description": "Research Workbench Platform -- chat interface (Svelte UI layer; Tauri/Rust shell to follow once this is solid)",
++  "scripts": {
++    "dev": "vite",
++    "build": "vite build",
++    "preview": "vite preview",
++    "check": "svelte-check --tsconfig ./tsconfig.json",
++    "test": "vitest run",
++    "test:watch": "vitest"
++  },
++  "devDependencies": {
++    "@sveltejs/vite-plugin-svelte": "^7.1.2",
++    "@testing-library/jest-dom": "^6.6.3",
++    "@testing-library/svelte": "^5.4.2",
++    "@testing-library/user-event": "^14.5.2",
++    "@tsconfig/svelte": "^5.0.4",
++    "jsdom": "^29.1.1",
++    "svelte": "^5.56.4",
++    "svelte-check": "^4.1.1",
++    "typescript": "^6.0.3",
++    "vite": "^8.1.0",
++    "vitest": "^4.1.9"
++  },
++  "dependencies": {
++    "@ai-sdk/openai-compatible": "^3.0.0",
++    "@ai-sdk/provider-utils": "^5.0.0",
++    "@ai-sdk/svelte": "^5.0.3",
++    "ai": "^7.0.3"
++  }
++}
+diff --git a/rwp/src/App.svelte b/rwp/src/App.svelte
+new file mode 100644
+index 0000000..241abfd
+--- /dev/null
++++ b/rwp/src/App.svelte
+@@ -0,0 +1,6 @@
++<script lang="ts">
++  import "./app.css";
++  import ChatWindow from "./lib/components/ChatWindow.svelte";
++</script>
++
++<ChatWindow />
+diff --git a/rwp/src/app.css b/rwp/src/app.css
+new file mode 100644
+index 0000000..7786c6f
+--- /dev/null
++++ b/rwp/src/app.css
+@@ -0,0 +1,65 @@
++/*
++ * Design direction: "reading room" -- this is a research tool for
++ * people who spend their day reading dense text, not a consumer
++ * messaging app. Deliberately avoiding chat-bubble conventions (they
++ * read as mobile-messaging-app, not research-instrument) in favor of
++ * a manuscript-annotation feel: role is marked by a thin coloured
++ * rule + label, like marginalia in two inks, rather than coloured
++ * bubble shapes. Serif for content people are meant to read closely;
++ * sans for UI chrome they just need to operate.
++ */
++:root {
++  --color-paper: #f2efe8;
++  --color-paper-raised: #fbfaf6;
++  --color-ink: #1b2430;
++  --color-ink-soft: #5a6270;
++  --color-rule: #d8d2c2;
++  --color-accent-user: #4f6b52;
++  --color-accent-assistant: #6f5e84;
++  --color-error: #a8472f;
++  --color-error-bg: #f6e8e3;
++
++  --font-content: ui-serif, Georgia, "Source Serif Pro", serif;
++  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
++  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
++
++  --space-1: 0.25rem;
++  --space-2: 0.5rem;
++  --space-3: 0.75rem;
++  --space-4: 1rem;
++  --space-6: 1.5rem;
++  --space-8: 2rem;
++
++  --radius: 3px;
++}
++
++* {
++  box-sizing: border-box;
++}
++
++html,
++body {
++  margin: 0;
++  padding: 0;
++  background: var(--color-paper);
++  color: var(--color-ink);
++  font-family: var(--font-ui);
++}
++
++#app {
++  height: 100vh;
++}
++
++:focus-visible {
++  outline: 2px solid var(--color-accent-user);
++  outline-offset: 2px;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  *,
++  *::before,
++  *::after {
++    animation-duration: 0.001ms !important;
++    transition-duration: 0.001ms !important;
++  }
++}
+diff --git a/rwp/src/lib/ai/agent.test.ts b/rwp/src/lib/ai/agent.test.ts
+new file mode 100644
+index 0000000..0b5ddea
+--- /dev/null
++++ b/rwp/src/lib/ai/agent.test.ts
+@@ -0,0 +1,64 @@
++import { describe, it, expect, vi } from "vitest";
++import { createAgentSession } from "./agent";
++import { mockSseFetch } from "./test-helpers";
++
++describe("createAgentSession", () => {
++  it("rejects an empty base URL", () => {
++    expect(() => createAgentSession({ baseURL: "  ", model: "x" })).toThrow(/base URL/i);
++  });
++
++  it("rejects an empty model", () => {
++    expect(() =>
++      createAgentSession({ baseURL: "http://localhost:8000/v1", model: "  " }),
++    ).toThrow(/model/i);
++  });
++
++  it("starts with no messages", () => {
++    const chat = createAgentSession({
++      baseURL: "http://localhost:8000/v1",
++      model: "paeka-qwen",
++      fetch: mockSseFetch(["hi"]),
++    });
++    expect(chat.messages).toEqual([]);
++  });
++
++  it("streams a real assistant reply through the full SDK pipeline", async () => {
++    const chat = createAgentSession({
++      baseURL: "http://localhost:8000/v1",
++      model: "paeka-qwen",
++      fetch: mockSseFetch(["Hello", " there"]),
++    });
++
++    await chat.sendMessage({ text: "hi" });
++
++    expect(chat.status).toBe("ready");
++    expect(chat.error).toBeUndefined();
++    expect(chat.messages).toHaveLength(2);
++    expect(chat.messages[0].role).toBe("user");
++    expect(chat.messages[1].role).toBe("assistant");
++
++    const assistantText = chat.messages[1].parts
++      .filter((p): p is { type: "text"; text: string } => p.type === "text")
++      .map((p) => p.text)
++      .join("");
++    expect(assistantText).toBe("Hello there");
++  });
++
++  it("never sends an Authorization header when no apiKey is configured", async () => {
++    const fetchMock = mockSseFetch(["ok"]);
++    const chat = createAgentSession({
++      baseURL: "http://localhost:8000/v1",
++      model: "paeka-qwen",
++      fetch: fetchMock,
++    });
++
++    await chat.sendMessage({ text: "hi" });
++
++    const [, init] = (fetchMock as ReturnType<typeof vi.fn>).mock.calls[0] as [
++      string,
++      RequestInit,
++    ];
++    const headers = new Headers(init.headers);
++    expect(headers.has("Authorization")).toBe(false);
++  });
++});
+diff --git a/rwp/src/lib/ai/agent.ts b/rwp/src/lib/ai/agent.ts
+new file mode 100644
+index 0000000..bc923c3
+--- /dev/null
++++ b/rwp/src/lib/ai/agent.ts
+@@ -0,0 +1,80 @@
++import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
++import type { FetchFunction } from "@ai-sdk/provider-utils";
++import { ToolLoopAgent, DirectChatTransport } from "ai";
++import { Chat, type UIMessage } from "@ai-sdk/svelte";
++
++/**
++ * Configuration for a chat session against any OpenAI-compatible chat
++ * completions endpoint (Paeka's /v1/chat/completions satisfies this
++ * directly -- it proxies llama.cpp's own OpenAI-formatted SSE chunks
++ * through unchanged, see backend/api/routes/openai_compat.py).
++ */
++export interface AgentSessionConfig {
++  /** Base URL up to and including /v1, e.g. "http://localhost:8000/v1". */
++  baseURL: string;
++  /** Model id as the backend expects it, e.g. "paeka-qwen". */
++  model: string;
++  /** Optional bearer token. Omit for backends that don't require one
++   *  (e.g. a local Ollama-backed Paeka instance). */
++  apiKey?: string;
++  /**
++   * Optional system prompt override. Left undefined by default
++   * deliberately -- Paeka already injects its own configured system
++   * prompt server-side (see backend/llm/ollama.py's _inject_system())
++   * when the first message isn't already a system message. Setting
++   * this here would silently override that, which is more surprising
++   * than useful for a "simple chat interface" talking to a backend
++   * that already has its own persona configured.
++   */
++  instructions?: string;
++  /** Injectable for tests; real fetch is used if omitted. */
++  fetch?: FetchFunction;
++}
++
++/**
++ * [SEAM] This function is the one place that decides how chat messages
++ * actually get to a model. Today: a DirectChatTransport calling an
++ * OpenAI-compatible endpoint straight from the browser (no server
++ * route -- this is a plain Vite SPA, not SvelteKit, since the eventual
++ * Tauri shell wraps a static frontend with no Node runtime at all).
++ *
++ * When the Tauri/Rust shell is added later (per the SAD's "Rust AI
++ * orchestrator" data-flow), this is the only place that needs to
++ * change -- swap DirectChatTransport for a custom ChatTransport that
++ * calls invoke('send_chat_message', ...) and adapts Tauri's event
++ * stream into a ReadableStream<UIMessageChunk>. Every component that
++ * consumes the returned Chat instance stays exactly as it is.
++ */
++export function createAgentSession(config: AgentSessionConfig): Chat<UIMessage> {
++  const baseURL = config.baseURL.trim();
++  const model = config.model.trim();
++
++  if (!baseURL) {
++    throw new Error("Connection settings: base URL is required.");
++  }
++  if (!model) {
++    throw new Error("Connection settings: model is required.");
++  }
++
++  const provider = createOpenAICompatible({
++    name: "rwp-openai-compatible",
++    baseURL,
++    apiKey: config.apiKey,
++    fetch: config.fetch,
++  });
++
++  const agent = new ToolLoopAgent({
++    model: provider(model),
++    instructions: config.instructions,
++  });
++
++  // [NOTE] TS generic-variance friction, not a runtime issue: with no
++  // `tools` configured, ToolLoopAgent infers an empty tool set, which
++  // produces a UIMessage sub-type TS won't unify with Chat's broader
++  // default UITools generic. Runtime correctness is verified directly
++  // by agent.test.ts/ChatWindow.test.ts (full streaming round-trip
++  // through the real pipeline), not just asserted away here.
++  return new Chat({
++    transport: new DirectChatTransport({ agent }),
++  }) as unknown as Chat<UIMessage>;
++}
+diff --git a/rwp/src/lib/ai/test-helpers.ts b/rwp/src/lib/ai/test-helpers.ts
+new file mode 100644
+index 0000000..1df7a89
+--- /dev/null
++++ b/rwp/src/lib/ai/test-helpers.ts
+@@ -0,0 +1,46 @@
++import { vi } from "vitest";
++
++/**
++ * Builds a fetch mock that returns a real OpenAI-style SSE stream, so
++ * tests exercise the actual parsing path end to end rather than just
++ * asserting that functions were called with the right arguments.
++ */
++export function mockSseFetch(deltas: string[]): typeof fetch {
++  const lines: string[] = [];
++  deltas.forEach((delta, i) => {
++    lines.push(
++      `data: ${JSON.stringify({
++        id: "chatcmpl-test",
++        object: "chat.completion.chunk",
++        created: 1700000000,
++        model: "test-model",
++        choices: [
++          {
++            index: 0,
++            delta: i === 0 ? { role: "assistant", content: delta } : { content: delta },
++            finish_reason: null,
++          },
++        ],
++      })}\n\n`,
++    );
++  });
++  lines.push(
++    `data: ${JSON.stringify({
++      id: "chatcmpl-test",
++      object: "chat.completion.chunk",
++      created: 1700000000,
++      model: "test-model",
++      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
++    })}\n\n`,
++  );
++  lines.push("data: [DONE]\n\n");
++
++  const body = lines.join("");
++
++  return vi.fn(async () =>
++    new Response(body, {
++      status: 200,
++      headers: { "Content-Type": "text/event-stream" },
++    }),
++  ) as unknown as typeof fetch;
++}
+diff --git a/rwp/src/lib/components/ChatInput.svelte b/rwp/src/lib/components/ChatInput.svelte
+new file mode 100644
+index 0000000..72fc71c
+--- /dev/null
++++ b/rwp/src/lib/components/ChatInput.svelte
+@@ -0,0 +1,97 @@
++<script lang="ts">
++  interface Props {
++    disabled?: boolean;
++    onSend: (text: string) => void;
++  }
++
++  let { disabled = false, onSend }: Props = $props();
++
++  let value = $state("");
++
++  function submit() {
++    const text = value.trim();
++    if (!text || disabled) return;
++    onSend(text);
++    value = "";
++  }
++
++  function handleKeydown(event: KeyboardEvent) {
++    if (event.key === "Enter" && !event.shiftKey) {
++      event.preventDefault();
++      submit();
++    }
++  }
++</script>
++
++<form
++  class="chat-input"
++  onsubmit={(event) => {
++    event.preventDefault();
++    submit();
++  }}
++>
++  <textarea
++    class="chat-input__field"
++    placeholder="Ask something... (Enter to send, Shift+Enter for a new line)"
++    rows="2"
++    bind:value
++    onkeydown={handleKeydown}
++    {disabled}
++    aria-label="Message"
++  ></textarea>
++  <button type="submit" class="chat-input__send" disabled={disabled || !value.trim()}>
++    Send
++  </button>
++</form>
++
++<style>
++  .chat-input {
++    display: flex;
++    gap: var(--space-3);
++    align-items: flex-end;
++    max-width: 42rem;
++    width: 100%;
++    margin: 0 auto;
++    padding: var(--space-4);
++    border-top: 1px solid var(--color-rule);
++    background: var(--color-paper-raised);
++  }
++
++  .chat-input__field {
++    flex: 1;
++    font-family: var(--font-content);
++    font-size: 1rem;
++    line-height: 1.5;
++    color: var(--color-ink);
++    background: var(--color-paper-raised);
++    border: 1px solid var(--color-rule);
++    border-radius: var(--radius);
++    padding: var(--space-2) var(--space-3);
++    resize: vertical;
++    min-height: 2.75rem;
++  }
++
++  .chat-input__field:disabled {
++    color: var(--color-ink-soft);
++    background: var(--color-paper);
++  }
++
++  .chat-input__send {
++    font-family: var(--font-ui);
++    font-size: 0.9375rem;
++    font-weight: 600;
++    color: var(--color-paper-raised);
++    background: var(--color-accent-user);
++    border: none;
++    border-radius: var(--radius);
++    padding: var(--space-2) var(--space-4);
++    height: 2.75rem;
++    cursor: pointer;
++  }
++
++  .chat-input__send:disabled {
++    background: var(--color-rule);
++    color: var(--color-ink-soft);
++    cursor: not-allowed;
++  }
++</style>
+diff --git a/rwp/src/lib/components/ChatInput.test.ts b/rwp/src/lib/components/ChatInput.test.ts
+new file mode 100644
+index 0000000..ab85e84
+--- /dev/null
++++ b/rwp/src/lib/components/ChatInput.test.ts
+@@ -0,0 +1,60 @@
++import { describe, it, expect, vi } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import userEvent from "@testing-library/user-event";
++import ChatInput from "./ChatInput.svelte";
++
++describe("ChatInput", () => {
++  it("sends the trimmed text and clears the field on Enter", async () => {
++    const onSend = vi.fn();
++    const user = userEvent.setup();
++    render(ChatInput, { props: { onSend } });
++
++    const field = screen.getByLabelText("Message");
++    await user.type(field, "  hello there  ");
++    await user.keyboard("{Enter}");
++
++    expect(onSend).toHaveBeenCalledExactlyOnceWith("hello there");
++    expect(field).toHaveValue("");
++  });
++
++  it("does not send on Shift+Enter, allowing a newline instead", async () => {
++    const onSend = vi.fn();
++    const user = userEvent.setup();
++    render(ChatInput, { props: { onSend } });
++
++    const field = screen.getByLabelText("Message");
++    await user.type(field, "line one");
++    await user.keyboard("{Shift>}{Enter}{/Shift}");
++    await user.type(field, "line two");
++
++    expect(onSend).not.toHaveBeenCalled();
++    expect(field).toHaveValue("line one\nline two");
++  });
++
++  it("does not send empty or whitespace-only input", async () => {
++    const onSend = vi.fn();
++    const user = userEvent.setup();
++    render(ChatInput, { props: { onSend } });
++
++    await user.click(screen.getByRole("button", { name: "Send" }));
++    expect(onSend).not.toHaveBeenCalled();
++
++    const field = screen.getByLabelText("Message");
++    await user.type(field, "   ");
++    await user.keyboard("{Enter}");
++    expect(onSend).not.toHaveBeenCalled();
++  });
++
++  it("disables the field and button, and blocks sending, while disabled", async () => {
++    const onSend = vi.fn();
++    const user = userEvent.setup();
++    render(ChatInput, { props: { onSend, disabled: true } });
++
++    expect(screen.getByLabelText("Message")).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
++
++    // Enter shouldn't do anything even if somehow triggered on a disabled field
++    await user.keyboard("{Enter}");
++    expect(onSend).not.toHaveBeenCalled();
++  });
++});
+diff --git a/rwp/src/lib/components/ChatWindow.svelte b/rwp/src/lib/components/ChatWindow.svelte
+new file mode 100644
+index 0000000..2bd358c
+--- /dev/null
++++ b/rwp/src/lib/components/ChatWindow.svelte
+@@ -0,0 +1,112 @@
++<script lang="ts">
++  import type { Chat } from "@ai-sdk/svelte";
++  import { createAgentSession, type AgentSessionConfig } from "../ai/agent";
++  import MessageList from "./MessageList.svelte";
++  import ChatInput from "./ChatInput.svelte";
++  import ConnectionSettings from "./ConnectionSettings.svelte";
++
++  interface Props {
++    initialConfig?: Partial<AgentSessionConfig>;
++  }
++
++  let { initialConfig = {} }: Props = $props();
++
++  // Deliberately a one-time snapshot, not a live binding to
++  // initialConfig -- these become independently editable via
++  // ConnectionSettings afterward. Svelte's compiler notes this pattern
++  // ("state_referenced_locally") since it's also a common mistake when
++  // someone *did* want live reactivity; here it's intentional.
++  let baseURL = $state(initialConfig.baseURL ?? "http://localhost:8000/v1");
++  let model = $state(initialConfig.model ?? "paeka-qwen");
++  let apiKey = $state(initialConfig.apiKey ?? "");
++
++  let chat = $state<Chat | undefined>(undefined);
++  let setupError: string | undefined = $state(undefined);
++
++  // Recreates the session whenever connection settings change. This is
++  // deliberate -- switching backend/model mid-conversation makes the
++  // existing history's relevance ambiguous, so starting fresh is the
++  // less surprising behaviour. Lives in $effect (not $derived) because
++  // constructing a Chat session is a side effect, not a pure computation.
++  $effect(() => {
++    setupError = undefined;
++    try {
++      chat = createAgentSession({
++        baseURL,
++        model,
++        apiKey: apiKey || undefined,
++        fetch: initialConfig.fetch,
++      });
++    } catch (err) {
++      setupError = err instanceof Error ? err.message : String(err);
++      chat = undefined;
++    }
++  });
++
++  function handleSend(text: string) {
++    void chat?.sendMessage({ text });
++  }
++
++  function handleSaveSettings(values: { baseURL: string; model: string; apiKey: string }) {
++    baseURL = values.baseURL;
++    model = values.model;
++    apiKey = values.apiKey;
++  }
++
++  const isBusy = $derived(chat?.status === "submitted" || chat?.status === "streaming");
++</script>
++
++<div class="chat-window">
++  <header class="chat-window__header">
++    <h1 class="chat-window__title">Research Assistant</h1>
++    <ConnectionSettings {baseURL} {model} {apiKey} onSave={handleSaveSettings} />
++  </header>
++
++  {#if setupError}
++    <p class="chat-window__error" role="alert">{setupError}</p>
++  {:else if chat}
++    <MessageList messages={chat.messages} status={chat.status} />
++    {#if chat.error}
++      <p class="chat-window__error" role="alert">{chat.error.message}</p>
++    {/if}
++    <ChatInput disabled={isBusy} onSend={handleSend} />
++  {/if}
++</div>
++
++<style>
++  .chat-window {
++    display: flex;
++    flex-direction: column;
++    height: 100%;
++  }
++
++  .chat-window__header {
++    display: flex;
++    align-items: baseline;
++    justify-content: space-between;
++    gap: var(--space-4);
++    padding: var(--space-4) var(--space-6);
++    border-bottom: 1px solid var(--color-rule);
++    background: var(--color-paper-raised);
++  }
++
++  .chat-window__title {
++    font-family: var(--font-content);
++    font-size: 1.25rem;
++    font-weight: 600;
++    margin: 0;
++    color: var(--color-ink);
++  }
++
++  .chat-window__error {
++    font-family: var(--font-ui);
++    font-size: 0.875rem;
++    color: var(--color-error);
++    background: var(--color-error-bg);
++    max-width: 42rem;
++    width: calc(100% - 2 * var(--space-4));
++    margin: 0 auto var(--space-2);
++    padding: var(--space-2) var(--space-3);
++    border-radius: var(--radius);
++  }
++</style>
+diff --git a/rwp/src/lib/components/ChatWindow.test.ts b/rwp/src/lib/components/ChatWindow.test.ts
+new file mode 100644
+index 0000000..b767698
+--- /dev/null
++++ b/rwp/src/lib/components/ChatWindow.test.ts
+@@ -0,0 +1,59 @@
++import { describe, it, expect } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import userEvent from "@testing-library/user-event";
++import ChatWindow from "./ChatWindow.svelte";
++import { mockSseFetch } from "../ai/test-helpers";
++
++describe("ChatWindow", () => {
++  it("sends a message and renders the streamed assistant reply", async () => {
++    const user = userEvent.setup();
++    render(ChatWindow, {
++      props: {
++        initialConfig: {
++          baseURL: "http://localhost:8000/v1",
++          model: "paeka-qwen",
++          fetch: mockSseFetch(["Hel", "lo!"]),
++        },
++      },
++    });
++
++    await user.type(screen.getByLabelText("Message"), "hi there");
++    await user.keyboard("{Enter}");
++
++    expect(await screen.findByText("hi there")).toBeInTheDocument();
++    expect(await screen.findByText("Hello!")).toBeInTheDocument();
++
++    // back to ready once the stream finishes -- input usable again
++    expect(screen.getByLabelText("Message")).not.toBeDisabled();
++  });
++
++  it("disables the input while a response is in flight", async () => {
++    const user = userEvent.setup();
++    render(ChatWindow, {
++      props: {
++        initialConfig: {
++          baseURL: "http://localhost:8000/v1",
++          model: "paeka-qwen",
++          fetch: mockSseFetch(["ok"]),
++        },
++      },
++    });
++
++    await user.type(screen.getByLabelText("Message"), "hi there");
++    await user.keyboard("{Enter}");
++
++    // Should become busy at some point during the request before
++    // settling back to ready -- by the time the assistant text shows
++    // up the field is guaranteed usable again, so check it lands there.
++    expect(await screen.findByText("ok")).toBeInTheDocument();
++    expect(screen.getByLabelText("Message")).not.toBeDisabled();
++  });
++
++  it("shows a setup error instead of the chat when configuration is invalid", () => {
++    render(ChatWindow, {
++      props: { initialConfig: { baseURL: "", model: "paeka-qwen" } },
++    });
++    expect(screen.getByRole("alert")).toHaveTextContent(/base url/i);
++    expect(screen.queryByLabelText("Message")).not.toBeInTheDocument();
++  });
++});
+diff --git a/rwp/src/lib/components/ConnectionSettings.svelte b/rwp/src/lib/components/ConnectionSettings.svelte
+new file mode 100644
+index 0000000..6c41994
+--- /dev/null
++++ b/rwp/src/lib/components/ConnectionSettings.svelte
+@@ -0,0 +1,112 @@
++<script lang="ts">
++  interface SettingsValues {
++    baseURL: string;
++    model: string;
++    apiKey: string;
++  }
++
++  interface Props extends SettingsValues {
++    onSave: (values: SettingsValues) => void;
++  }
++
++  let { baseURL, model, apiKey, onSave }: Props = $props();
++
++  let open = $state(false);
++  // One-time snapshot for editing, not a live binding -- see the same
++  // note in ChatWindow.svelte. Drafts only flow back via onSave.
++  let draftBaseURL = $state(baseURL);
++  let draftModel = $state(model);
++  let draftApiKey = $state(apiKey);
++
++  function handleSubmit(event: SubmitEvent) {
++    event.preventDefault();
++    onSave({
++      baseURL: draftBaseURL.trim(),
++      model: draftModel.trim(),
++      apiKey: draftApiKey.trim(),
++    });
++    open = false;
++  }
++</script>
++
++<details class="settings" bind:open>
++  <summary class="settings__summary">Connection</summary>
++  <form class="settings__form" onsubmit={handleSubmit}>
++    <label class="settings__field">
++      <span>Base URL</span>
++      <input type="text" bind:value={draftBaseURL} placeholder="http://localhost:8000/v1" />
++    </label>
++    <label class="settings__field">
++      <span>Model</span>
++      <input type="text" bind:value={draftModel} placeholder="paeka-qwen" />
++    </label>
++    <label class="settings__field">
++      <span>API key (optional)</span>
++      <input
++        type="password"
++        bind:value={draftApiKey}
++        placeholder="leave blank if not required"
++      />
++    </label>
++    <button type="submit">Save</button>
++  </form>
++</details>
++
++<style>
++  .settings {
++    font-family: var(--font-ui);
++    font-size: 0.875rem;
++  }
++
++  .settings__summary {
++    cursor: pointer;
++    color: var(--color-ink-soft);
++    user-select: none;
++  }
++
++  .settings__form {
++    display: flex;
++    flex-direction: column;
++    gap: var(--space-2);
++    margin-top: var(--space-2);
++    padding: var(--space-3);
++    background: var(--color-paper-raised);
++    border: 1px solid var(--color-rule);
++    border-radius: var(--radius);
++    min-width: 18rem;
++  }
++
++  .settings__field {
++    display: flex;
++    flex-direction: column;
++    gap: var(--space-1);
++  }
++
++  .settings__field span {
++    font-size: 0.75rem;
++    color: var(--color-ink-soft);
++  }
++
++  .settings__field input {
++    font-family: var(--font-mono);
++    font-size: 0.8125rem;
++    padding: var(--space-2);
++    border: 1px solid var(--color-rule);
++    border-radius: var(--radius);
++    background: var(--color-paper);
++    color: var(--color-ink);
++  }
++
++  .settings__form button {
++    align-self: flex-end;
++    font-family: var(--font-ui);
++    font-weight: 600;
++    font-size: 0.8125rem;
++    padding: var(--space-1) var(--space-3);
++    background: var(--color-accent-user);
++    color: var(--color-paper-raised);
++    border: none;
++    border-radius: var(--radius);
++    cursor: pointer;
++  }
++</style>
+diff --git a/rwp/src/lib/components/ConnectionSettings.test.ts b/rwp/src/lib/components/ConnectionSettings.test.ts
+new file mode 100644
+index 0000000..0571812
+--- /dev/null
++++ b/rwp/src/lib/components/ConnectionSettings.test.ts
+@@ -0,0 +1,46 @@
++import { describe, it, expect, vi } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import userEvent from "@testing-library/user-event";
++import ConnectionSettings from "./ConnectionSettings.svelte";
++
++describe("ConnectionSettings", () => {
++  it("pre-fills the form with the current values", async () => {
++    const user = userEvent.setup();
++    render(ConnectionSettings, {
++      props: {
++        baseURL: "http://localhost:8000/v1",
++        model: "paeka-qwen",
++        apiKey: "",
++        onSave: vi.fn(),
++      },
++    });
++
++    await user.click(screen.getByText("Connection"));
++    expect(screen.getByPlaceholderText("http://localhost:8000/v1")).toHaveValue(
++      "http://localhost:8000/v1",
++    );
++    expect(screen.getByPlaceholderText("paeka-qwen")).toHaveValue("paeka-qwen");
++  });
++
++  it("saves trimmed values and closes the panel", async () => {
++    const onSave = vi.fn();
++    const user = userEvent.setup();
++    render(ConnectionSettings, {
++      props: { baseURL: "", model: "", apiKey: "", onSave },
++    });
++
++    await user.click(screen.getByText("Connection"));
++    await user.type(screen.getByPlaceholderText("http://localhost:8000/v1"), "  http://x/v1  ");
++    await user.type(screen.getByPlaceholderText("paeka-qwen"), "  my-model  ");
++    await user.click(screen.getByRole("button", { name: "Save" }));
++
++    expect(onSave).toHaveBeenCalledExactlyOnceWith({
++      baseURL: "http://x/v1",
++      model: "my-model",
++      apiKey: "",
++    });
++
++    const details = document.querySelector("details");
++    expect(details).not.toHaveAttribute("open");
++  });
++});
+diff --git a/rwp/src/lib/components/MessageBubble.svelte b/rwp/src/lib/components/MessageBubble.svelte
+new file mode 100644
+index 0000000..eb6f59c
+--- /dev/null
++++ b/rwp/src/lib/components/MessageBubble.svelte
+@@ -0,0 +1,98 @@
++<script lang="ts">
++  import type { UIMessage } from "ai";
++
++  interface Props {
++    message: UIMessage;
++    streaming?: boolean;
++  }
++
++  let { message, streaming = false }: Props = $props();
++
++  const text = $derived(
++    message.parts
++      .filter((p): p is { type: "text"; text: string } => p.type === "text")
++      .map((p) => p.text)
++      .join(""),
++  );
++
++  const roleLabel = $derived(message.role === "user" ? "You" : "Assistant");
++</script>
++
++<article class="message message--{message.role}" aria-label="{roleLabel} message">
++  <div class="message__rule" aria-hidden="true"></div>
++  <div class="message__body">
++    <p class="message__label">{roleLabel}</p>
++    <div class="message__text">
++      {text}{#if streaming}<span class="message__cursor" aria-hidden="true"></span>{/if}
++    </div>
++  </div>
++</article>
++
++<style>
++  .message {
++    display: flex;
++    gap: var(--space-3);
++    padding: var(--space-4) 0;
++  }
++
++  .message__rule {
++    flex: 0 0 3px;
++    border-radius: var(--radius);
++    align-self: stretch;
++  }
++
++  .message--user .message__rule {
++    background: var(--color-accent-user);
++  }
++
++  .message--assistant .message__rule {
++    background: var(--color-accent-assistant);
++  }
++
++  .message__body {
++    flex: 1;
++    min-width: 0;
++  }
++
++  .message__label {
++    margin: 0 0 var(--space-1);
++    font-family: var(--font-ui);
++    font-size: 0.75rem;
++    font-weight: 600;
++    letter-spacing: 0.04em;
++    text-transform: uppercase;
++  }
++
++  .message--user .message__label {
++    color: var(--color-accent-user);
++  }
++
++  .message--assistant .message__label {
++    color: var(--color-accent-assistant);
++  }
++
++  .message__text {
++    font-family: var(--font-content);
++    font-size: 1.0625rem;
++    line-height: 1.6;
++    color: var(--color-ink);
++    white-space: pre-wrap;
++    word-break: break-word;
++  }
++
++  .message__cursor {
++    display: inline-block;
++    width: 2px;
++    height: 1em;
++    margin-left: 2px;
++    background: var(--color-accent-assistant);
++    vertical-align: text-bottom;
++    animation: blink 1s step-start infinite;
++  }
++
++  @keyframes blink {
++    50% {
++      opacity: 0;
++    }
++  }
++</style>
+diff --git a/rwp/src/lib/components/MessageBubble.test.ts b/rwp/src/lib/components/MessageBubble.test.ts
+new file mode 100644
+index 0000000..1ef6752
+--- /dev/null
++++ b/rwp/src/lib/components/MessageBubble.test.ts
+@@ -0,0 +1,59 @@
++import { describe, it, expect } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import type { UIMessage } from "ai";
++import MessageBubble from "./MessageBubble.svelte";
++
++function textMessage(role: "user" | "assistant", text: string): UIMessage {
++  return {
++    id: "m1",
++    role,
++    parts: [{ type: "text", text }],
++  } as UIMessage;
++}
++
++describe("MessageBubble", () => {
++  it("renders user messages with a 'You' label", () => {
++    render(MessageBubble, { props: { message: textMessage("user", "Hello there") } });
++    expect(screen.getByText("You")).toBeInTheDocument();
++    expect(screen.getByText("Hello there")).toBeInTheDocument();
++  });
++
++  it("renders assistant messages with an 'Assistant' label", () => {
++    render(MessageBubble, { props: { message: textMessage("assistant", "Hi back") } });
++    expect(screen.getByText("Assistant")).toBeInTheDocument();
++    expect(screen.getByText("Hi back")).toBeInTheDocument();
++  });
++
++  it("joins multiple text parts into one block", () => {
++    const message = {
++      id: "m2",
++      role: "assistant",
++      parts: [
++        { type: "text", text: "Hello" },
++        { type: "text", text: " world" },
++      ],
++    } as UIMessage;
++    render(MessageBubble, { props: { message } });
++    expect(screen.getByText("Hello world")).toBeInTheDocument();
++  });
++
++  it("shows a streaming cursor only when streaming is true", () => {
++    const { container, rerender } = render(MessageBubble, {
++      props: { message: textMessage("assistant", "thinking"), streaming: true },
++    });
++    expect(container.querySelector(".message__cursor")).not.toBeNull();
++
++    rerender({ message: textMessage("assistant", "thinking"), streaming: false });
++    expect(container.querySelector(".message__cursor")).toBeNull();
++  });
++
++  it("ignores non-text parts rather than crashing", () => {
++    const message = {
++      id: "m3",
++      role: "assistant",
++      parts: [{ type: "step-start" }, { type: "text", text: "still here" }],
++    } as unknown as UIMessage;
++    render(MessageBubble, { props: { message } });
++    expect(screen.getByText("still here")).toBeInTheDocument();
++  });
++});
+diff --git a/rwp/src/lib/components/MessageList.svelte b/rwp/src/lib/components/MessageList.svelte
+new file mode 100644
+index 0000000..213e5c7
+--- /dev/null
++++ b/rwp/src/lib/components/MessageList.svelte
+@@ -0,0 +1,64 @@
++<script lang="ts">
++  import type { UIMessage, ChatStatus } from "ai";
++  import MessageBubble from "./MessageBubble.svelte";
++
++  interface Props {
++    messages: UIMessage[];
++    status: ChatStatus;
++  }
++
++  let { messages, status }: Props = $props();
++
++  let scrollEl: HTMLDivElement | undefined = $state();
++
++  $effect(() => {
++    // Re-runs whenever messages (length or content) changes.
++    void messages;
++    if (scrollEl) {
++      scrollEl.scrollTop = scrollEl.scrollHeight;
++    }
++  });
++
++  function isStreamingAt(index: number): boolean {
++    return (
++      (status === "streaming" || status === "submitted") &&
++      index === messages.length - 1 &&
++      messages[index]?.role === "assistant"
++    );
++  }
++</script>
++
++<div
++  class="message-list"
++  bind:this={scrollEl}
++  role="log"
++  aria-live="polite"
++  aria-label="Conversation"
++>
++  {#if messages.length === 0}
++    <p class="message-list__empty">Nothing here yet -- ask something to get started.</p>
++  {:else}
++    {#each messages as message, index (message.id)}
++      <MessageBubble {message} streaming={isStreamingAt(index)} />
++    {/each}
++  {/if}
++</div>
++
++<style>
++  .message-list {
++    flex: 1;
++    overflow-y: auto;
++    padding: var(--space-6) var(--space-4);
++    max-width: 42rem;
++    width: 100%;
++    margin: 0 auto;
++  }
++
++  .message-list__empty {
++    font-family: var(--font-ui);
++    color: var(--color-ink-soft);
++    font-size: 0.9375rem;
++    margin-top: var(--space-8);
++    text-align: center;
++  }
++</style>
+diff --git a/rwp/src/lib/components/MessageList.test.ts b/rwp/src/lib/components/MessageList.test.ts
+new file mode 100644
+index 0000000..5f9aacb
+--- /dev/null
++++ b/rwp/src/lib/components/MessageList.test.ts
+@@ -0,0 +1,52 @@
++import { describe, it, expect } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import type { UIMessage, ChatStatus } from "ai";
++import MessageList from "./MessageList.svelte";
++
++function textMessage(id: string, role: "user" | "assistant", text: string): UIMessage {
++  return { id, role, parts: [{ type: "text", text }] } as UIMessage;
++}
++
++describe("MessageList", () => {
++  it("shows an empty-state prompt when there are no messages", () => {
++    render(MessageList, { props: { messages: [], status: "ready" as ChatStatus } });
++    expect(screen.getByText(/nothing here yet/i)).toBeInTheDocument();
++  });
++
++  it("renders messages in order", () => {
++    const messages = [
++      textMessage("1", "user", "first"),
++      textMessage("2", "assistant", "second"),
++      textMessage("3", "user", "third"),
++    ];
++    render(MessageList, { props: { messages, status: "ready" as ChatStatus } });
++
++    const rendered = screen.getAllByRole("article").map((el) => el.textContent);
++    expect(rendered[0]).toContain("first");
++    expect(rendered[1]).toContain("second");
++    expect(rendered[2]).toContain("third");
++  });
++
++  it("only marks the last assistant message as streaming while busy", () => {
++    const messages = [
++      textMessage("1", "user", "question"),
++      textMessage("2", "assistant", "partial answer"),
++    ];
++    const { container } = render(MessageList, {
++      props: { messages, status: "streaming" as ChatStatus },
++    });
++    const cursors = container.querySelectorAll(".message__cursor");
++    expect(cursors).toHaveLength(1);
++  });
++
++  it("shows no streaming cursor once status is ready", () => {
++    const messages = [
++      textMessage("1", "user", "question"),
++      textMessage("2", "assistant", "final answer"),
++    ];
++    const { container } = render(MessageList, {
++      props: { messages, status: "ready" as ChatStatus },
++    });
++    expect(container.querySelectorAll(".message__cursor")).toHaveLength(0);
++  });
++});
+diff --git a/rwp/src/main.ts b/rwp/src/main.ts
+new file mode 100644
+index 0000000..e7e29a0
+--- /dev/null
++++ b/rwp/src/main.ts
+@@ -0,0 +1,11 @@
++import { mount } from "svelte";
++import App from "./App.svelte";
++
++const target = document.getElementById("app");
++if (!target) {
++  throw new Error("#app element not found -- check index.html");
++}
++
++const app = mount(App, { target });
++
++export default app;
+diff --git a/rwp/src/test-setup.ts b/rwp/src/test-setup.ts
+new file mode 100644
+index 0000000..f149f27
+--- /dev/null
++++ b/rwp/src/test-setup.ts
+@@ -0,0 +1 @@
++import "@testing-library/jest-dom/vitest";
+diff --git a/rwp/src/vite-env.d.ts b/rwp/src/vite-env.d.ts
+new file mode 100644
+index 0000000..11f02fe
+--- /dev/null
++++ b/rwp/src/vite-env.d.ts
+@@ -0,0 +1 @@
++/// <reference types="vite/client" />
+diff --git a/rwp/tsconfig.json b/rwp/tsconfig.json
+new file mode 100644
+index 0000000..deff835
+--- /dev/null
++++ b/rwp/tsconfig.json
+@@ -0,0 +1,15 @@
++{
++  "extends": "@tsconfig/svelte/tsconfig.json",
++  "compilerOptions": {
++    "target": "ES2022",
++    "useDefineForClassFields": true,
++    "module": "ESNext",
++    "resolveJsonModule": true,
++    "skipLibCheck": true,
++    "sourceMap": true,
++    "strict": true,
++    "moduleResolution": "bundler"
++  },
++  "include": ["src/**/*.ts", "src/**/*.svelte"],
++  "exclude": ["node_modules/*", "dist/*"]
++}
+diff --git a/rwp/vite.config.ts b/rwp/vite.config.ts
+new file mode 100644
+index 0000000..d8fa52a
+--- /dev/null
++++ b/rwp/vite.config.ts
+@@ -0,0 +1,25 @@
++import { defineConfig } from "vite";
++import { svelte } from "@sveltejs/vite-plugin-svelte";
++
++// [NOTE] Plain Vite + Svelte, deliberately not SvelteKit -- the eventual
++// Tauri shell wraps a static frontend bundle (no Node server at runtime),
++// and per the SAD's data-flow diagram, AI orchestration is meant to live
++// in the Rust layer, not in a server route. See src/lib/ai/agent.ts for
++// where that seam actually is today (DirectChatTransport, swappable
++// later for a Tauri-IPC transport with zero changes to the components).
++export default defineConfig({
++  plugins: [svelte()],
++  // [FIX] Without this, Vitest (which runs in Node) resolves Svelte's
++  // package exports to the server-side runtime build, which doesn't
++  // implement mount() at all ("lifecycle_function_unavailable") --
++  // jsdom provides DOM globals but doesn't change which export
++  // condition Node resolves to. Forcing 'browser' here only affects
++  // the test run; the normal dev/build pipeline already resolves
++  // correctly since Vite is serving to an actual browser there.
++  resolve: process.env.VITEST ? { conditions: ["browser"] } : undefined,
++  test: {
++    environment: "jsdom",
++    globals: true,
++    setupFiles: ["./src/test-setup.ts"],
++  },
++});

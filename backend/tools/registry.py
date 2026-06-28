@@ -76,16 +76,21 @@ def get_registered_tools(request) -> dict[str, ToolFn]:
     tools["typecheck_code"] = typecheck_code
 
     # ── Sandboxed code execution ──────────────────────────────────────
-    async def execute_code(code: str, language: str = "python") -> str:
-        """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
-        from backend.agent.sandbox import get_sandbox
-        sandbox = get_sandbox()
-        if not await sandbox.is_available():
-            return "Docker sandbox unavailable."
-        result = await sandbox.execute(code, language=language, timeout=30)
-        return result.output
+    # [FIX] Was unconditionally calling get_sandbox() regardless of
+    # [sandbox] enabled -- the tool would still work even with the
+    # feature explicitly disabled in settings. Now mirrors the
+    # web_search/retrieve pattern above: only register if app.state
+    # actually has it (set in app.py based on settings.sandbox.enabled).
+    sandbox = getattr(request.app.state, "sandbox", None)
+    if sandbox is not None:
+        async def execute_code(code: str, language: str = "python") -> str:
+            """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
+            if not await sandbox.is_available():
+                return "Docker sandbox unavailable."
+            result = await sandbox.execute(code, language=language, timeout=30)
+            return result.output
 
-    tools["execute_code"] = execute_code
+        tools["execute_code"] = execute_code
 
     # ── RAG retrieval ──────────────────────────────────────────────────
     retrieval = getattr(request.app.state, "retrieval", None)

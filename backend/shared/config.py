@@ -134,6 +134,15 @@ class SandboxSettings(BaseModel):
     max_timeout: int = 60
     memory_limit: str = "256m"
     cpu_limit: str = "1.0"
+    # [FIX] Set both together when paeka-api runs inside Docker Compose
+    # (sibling containers via the Docker socket) -- see SETUP_DOCKER.md
+    # section 4. scratch_dir is the in-container path where paeka-api
+    # mounted the named volume; scratch_volume is that volume's name,
+    # referenced by name (not path) when mounting into the sandbox
+    # container. Leave both None for native deployments (the default) --
+    # see backend/agent/sandbox.py's module docstring for why.
+    scratch_dir: str | None = None
+    scratch_volume: str | None = None
 
 
 class IterationSettings(BaseModel):

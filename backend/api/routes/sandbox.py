@@ -50,8 +50,8 @@ async def execute_code(
     """
     Execute code in an isolated Docker container.
 
-    Security: --network=none, --read-only, --cap-drop=ALL,
-              --memory=256m, --pids-limit=64, tmpfs /tmp
+    Security: --network=none, --read-only, --cap-drop=ALL, tmpfs /tmp.
+              memory/cpu/pids limits come from [sandbox] settings.
     """
     scanner = request.app.state.scanner
     if scanner:
@@ -62,7 +62,13 @@ async def execute_code(
                 detail=f"Code blocked by content security: {scan.findings[0]}",
             )
 
-    sandbox = get_sandbox()
+    sandbox = getattr(request.app.state, "sandbox", None)
+    if sandbox is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Sandbox is disabled (set [sandbox] enabled = true, or "
+                   "PAEKA_SANDBOX__ENABLED=true).",
+        )
 
     # Check Docker is available before attempting
     if not await sandbox.is_available():
@@ -71,10 +77,11 @@ async def execute_code(
             detail="Docker is not available. Ensure Docker is running on the host.",
         )
 
-    # [FIX] settings was fetched and never used -- max_timeout below is a
-    # hardcoded constant, not read from settings. Dead code.
-    max_timeout = 60   # hard cap regardless of user request
-    timeout = min(body.timeout or 30, max_timeout)
+    # [FIX] These now actually come from [sandbox] settings (default_timeout,
+    # max_timeout) instead of being hardcoded constants that silently
+    # ignored PAEKA_SANDBOX__DEFAULT_TIMEOUT / PAEKA_SANDBOX__MAX_TIMEOUT.
+    cfg = get_settings().sandbox
+    timeout = min(body.timeout or cfg.default_timeout, cfg.max_timeout)
 
     try:
         result = await sandbox.execute(

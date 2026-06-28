@@ -154,27 +154,96 @@ docker run --rm -v paeka_database:/data -v "$(pwd)":/backup busybox \
   tar czf /backup/paeka-db-backup.tar.gz -C / data
 ```
 
-## 4. Code execution sandbox (`execute_code`) — opt-in, not wired up by default
+## 4. Code execution sandbox (`execute_code`)
 
-The `execute_code` tool shells out to `docker run` on the host. Giving the
-`paeka-api` container that ability means mounting the host's Docker socket
-into it — which is effectively root-equivalent access to your host,
-regardless of any rootless settings elsewhere. That's a real trade-off,
-not a formality, so it's left off by default (matching the
-`docker_available=False` state you already saw in your test run).
+The `execute_code` tool shells out to `docker run` -- when `paeka-api` runs
+inside this compose stack, it needs a way to reach a Docker daemon at all,
+plus (ideally) a hardened runtime so sandboxed code doesn't share the host
+kernel. Two independent pieces, both already wired into this compose file:
 
-If you want it anyway:
+### 4a. Reaching Docker at all -- via a socket proxy, not a raw mount
 
-```yaml
-# add to the paeka-api service in docker-compose.yml
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # add this line
-```
+Mounting `/var/run/docker.sock` straight into `paeka-api` would work, but
+it's effectively root-equivalent access to your host for *any* process
+running in that container -- not a trade-off to make implicitly. Instead,
+`docker-socket-proxy` holds the real socket, and only exposes a narrow
+slice of the Docker API to `paeka-api` over the internal network
+(`DOCKER_HOST=tcp://docker-socket-proxy:2375`): create/start containers,
+pull the python/alpine/node sandbox images, and `docker info`. Everything
+else -- `exec` into arbitrary containers, touching volumes/networks
+directly, building images from an arbitrary Dockerfile, swarm, secrets --
+stays off. See the `docker-socket-proxy` service definition in
+`docker-compose.yml` for the exact list and why each one is on/off.
 
-...and add `docker-ce-cli` to the runtime stage of the Dockerfile (the
-`docker` Python-side code shells out to the `docker` *binary*, not the
-SDK). Sibling containers spawned this way run alongside `paeka-api`, not
-nested inside it — no Docker-in-Docker daemon needed.
+Honest caveat: this filters by API *category*, not by deep-inspecting the
+JSON body of a container-create call -- a real, meaningful narrowing, not
+a perfect one. If `paeka-api` were ever compromised, the proxy limits what
+it could do; it doesn't guarantee a create-call can't request something
+within an allowed category that's more than intended.
+
+This is on by default and needs nothing further from you -- `docker
+compose up -d --build` brings up the proxy alongside everything else.
+
+### 4b. The named-volume detail (already handled, just so you know why)
+
+`paeka-api`'s own filesystem isn't the real Docker host's filesystem.
+Writing a sandbox script to a plain tempdir inside `paeka-api` and asking
+the daemon (via the proxy) to bind-mount that path into a sibling
+container wouldn't work -- the daemon resolves that path against the
+actual host, not against `paeka-api`'s container, and finds nothing
+there. The fix is a Docker *named volume* (`paeka_sandbox_scratch`,
+declared in `docker-compose.yml`'s top-level `volumes:`), mounted into
+`paeka-api` and referenced *by name* in the sibling container's mount --
+resolved by the daemon itself, identically regardless of host OS or path
+translation. `PAEKA_SANDBOX__SCRATCH_DIR`/`PAEKA_SANDBOX__SCRATCH_VOLUME`
+in `paeka-api`'s environment point at this; you shouldn't need to touch
+either. See `backend/agent/sandbox.py`'s module docstring for the full
+explanation.
+
+### 4c. In-container hardening (seccomp, non-root UID, ulimits)
+
+Rather than a separate hardened runtime (gVisor/Kata), the sandbox goes
+deeper on the layer it already had -- no extra software to install, no
+daemon restart, nothing host-level. This was a deliberate choice given
+the actual threat model here: a single-user tool running LLM-generated
+code, not an adversarial multi-tenant service. A kernel-escape 0-day is
+the one thing a separate hardened runtime protects against that this
+doesn't -- a real but low-probability risk for this use case, traded
+off here against the operational cost of installing and maintaining a
+second runtime. If that trade-off ever stops feeling right, gVisor
+(`runsc`) is a drop-in `--runtime` flag away and doesn't need anything
+like Kata's hypervisor/guest-kernel management -- worth asking about
+again if the threat model changes (e.g. if this ever becomes
+multi-tenant).
+
+What's actually on every sandboxed container now, on top of what was
+already there (`--network none`, `--read-only`, `--cap-drop ALL`,
+`--security-opt no-new-privileges`, the existing memory/cpu/pids
+limits):
+
+- **A trimmed seccomp profile** (`backend/agent/sandbox-seccomp.json`)
+  -- Docker's own verified default allowlist (~440 syscalls) with the
+  ~53 syscalls gated behind capabilities removed. Since every
+  capability is already dropped, this changes nothing about what a
+  normal script can do, but means a future slip that re-adds a
+  capability (e.g. someone debugging adds `--cap-add SYS_PTRACE` and
+  forgets to remove it) still can't reach `ptrace`, `mount`, `unshare`,
+  `setns`, kernel module loading, etc. -- seccomp blocks them
+  independently of whatever capabilities happen to be held.
+- **`--user 65534:65534`** -- sandboxed code now runs as the
+  conventional "nobody" UID instead of root-in-container.
+- **`--ulimit nproc` / `--ulimit nofile`** -- a second, independently-
+  enforced process-count limit (rlimit, alongside the existing
+  cgroup-based `--pids-limit`) and an open-file-descriptor cap.
+
+Nothing to install or configure here -- this is already active. If a
+sandboxed script ever fails with something like `Operation not
+permitted` that didn't happen before, it's almost certainly the
+seccomp profile excluding a syscall a *specific* script genuinely
+needs (rather than something dangerous) -- check `docker compose logs
+paeka-api` for the actual error and let me know what the script was
+trying to do; loosening the profile for one specific verified-safe
+syscall is a quick, low-risk fix.
 
 ## Troubleshooting
 
@@ -186,3 +255,6 @@ nested inside it — no Docker-in-Docker daemon needed.
 | `paeka-ollama-init` exits non-zero | Check `models/qwen/Qwen3.5-9B-Q4_K_M.gguf` actually exists on the host — it's gitignored and not committed, so a fresh clone won't have it |
 | `could not select device driver` | NVIDIA Container Toolkit not installed/configured for this daemon, or you restarted the wrong daemon (rootless vs system) after `nvidia-ctk runtime configure`. **On Docker Desktop**, skip the toolkit install entirely — enable Settings → Resources → GPU support instead, and make sure it's the Windows-side NVIDIA driver installed, not a WSL-internal one. |
 | API can't reach Ollama/Qdrant | Confirm you're not also running the native `qdrant.exe` / `ollama serve` on the same ports — `127.0.0.1:6333` published by compose will conflict with anything already bound there |
+| `Sandbox status` still shows `docker_available: false` after `docker compose up` | Check `docker compose logs docker-socket-proxy` for startup errors first, then `docker compose logs paeka-api \| grep -i sandbox`. If the proxy container isn't `Up` at all, `paeka-api` started before it was ready -- `docker compose restart paeka-api` once the proxy is confirmed running. |
+| `execute_code` returns a Docker API error mentioning permission/forbidden, but `docker_available: true` | The socket-proxy is reachable but denied a specific call -- check it isn't trying to do something outside the allowed categories (see 4a). Re-check `docker compose logs docker-socket-proxy` for which endpoint got rejected. |
+| A sandboxed script fails with `Operation not permitted` that didn't fail before | The seccomp profile (4c) is excluding a syscall that specific script needs. Check `docker compose logs paeka-api` for what it was trying to do -- loosening the profile for one verified-safe syscall is a quick fix. |

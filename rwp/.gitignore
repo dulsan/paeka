@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.svelte-kit/
+
+# package manager artifacts -- repo targets Bun; if you verify locally
+# with npm instead, don't commit its lockfile alongside bun's
+package-lock.json
+yarn.lock
+
+*.log
+.DS_Store
+
+.vscode/
+.idea/
