@@ -1,32 +1,24 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { createAgentSession } from "./agent";
-import { mockSseFetch } from "./test-helpers";
+import { mockJsonFetch } from "./test-helpers";
 
 describe("createAgentSession", () => {
   it("rejects an empty base URL", () => {
-    expect(() => createAgentSession({ baseURL: "  ", model: "x" })).toThrow(/base URL/i);
-  });
-
-  it("rejects an empty model", () => {
-    expect(() =>
-      createAgentSession({ baseURL: "http://localhost:8000/v1", model: "  " }),
-    ).toThrow(/model/i);
+    expect(() => createAgentSession({ baseURL: "  " })).toThrow(/base URL/i);
   });
 
   it("starts with no messages", () => {
     const chat = createAgentSession({
       baseURL: "http://localhost:8000/v1",
-      model: "paeka-qwen",
-      fetch: mockSseFetch(["hi"]),
+      fetch: mockJsonFetch("hi"),
     });
     expect(chat.messages).toEqual([]);
   });
 
-  it("streams a real assistant reply through the full SDK pipeline", async () => {
+  it("sends a message and receives a real assistant reply through the full pipeline", async () => {
     const chat = createAgentSession({
       baseURL: "http://localhost:8000/v1",
-      model: "paeka-qwen",
-      fetch: mockSseFetch(["Hello", " there"]),
+      fetch: mockJsonFetch("Hello there"),
     });
 
     await chat.sendMessage({ text: "hi" });
@@ -44,17 +36,29 @@ describe("createAgentSession", () => {
     expect(assistantText).toBe("Hello there");
   });
 
-  it("never sends an Authorization header when no apiKey is configured", async () => {
-    const fetchMock = mockSseFetch(["ok"]);
+  it("derives /api/agent/react from a baseURL ending in /v1", async () => {
+    const fetchMock = mockJsonFetch("ok");
     const chat = createAgentSession({
       baseURL: "http://localhost:8000/v1",
-      model: "paeka-qwen",
       fetch: fetchMock,
     });
 
     await chat.sendMessage({ text: "hi" });
 
-    const [, init] = (fetchMock as ReturnType<typeof vi.fn>).mock.calls[0] as [
+    const [url] = (fetchMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+    expect(url).toBe("http://localhost:8000/api/agent/react");
+  });
+
+  it("never sends an Authorization header when no apiKey is configured", async () => {
+    const fetchMock = mockJsonFetch("ok");
+    const chat = createAgentSession({
+      baseURL: "http://localhost:8000/v1",
+      fetch: fetchMock,
+    });
+
+    await chat.sendMessage({ text: "hi" });
+
+    const [, init] = (fetchMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0] as [
       string,
       RequestInit,
     ];

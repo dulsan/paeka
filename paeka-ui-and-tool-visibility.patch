@@ -1,0 +1,2723 @@
+diff --git a/backend/agent/react_graph.py b/backend/agent/react_graph.py
+index ddbd83b..8ee391f 100644
+--- a/backend/agent/react_graph.py
++++ b/backend/agent/react_graph.py
+@@ -125,6 +125,10 @@ def _span(name: str, **attrs: Any):
+ # ReActGraph
+ # ---------------------------------------------------------------------------
+ 
++def _is_tool_error(content: str) -> bool:
++    return content.startswith("[MCP ERROR]") or content.startswith("[BLOCKED]")
++
++
+ class ReActGraph:
+     """Minimal two-node ReAct graph: agent_node <-> tool_node."""
+ 
+@@ -144,8 +148,20 @@ class ReActGraph:
+     async def run(
+         self,
+         user_message: str,
++        history: list[dict[str, str]] | None = None,
+         conversation_memory=None,
+-    ) -> str:
++    ) -> dict[str, Any]:
++        """
++        Returns {"response": str, "tool_calls": [...]}.
++
++        `history` is the prior turns of this conversation as plain
++        {"role", "content"} dicts (oldest first, NOT including
++        user_message itself) -- mirrors the shape /v1/chat/completions
++        already takes, since every call here is otherwise stateless
++        (each request gets its own fresh ReActGraph.run(), there is no
++        server-side session). Without it, every turn would start from
++        nothing and the chat UI's history would be theatre.
++        """
+         tool_schemas = await get_tool_schemas(mcp_url=self._mcp_url)
+ 
+         system_content = self._system_prompt
+@@ -161,10 +177,14 @@ class ReActGraph:
+             except Exception as exc:
+                 logger.warning("ConversationMemory.get_context() failed: %s", exc)
+ 
+-        initial_messages: list[BaseMessage] = [
+-            SystemMessage(content=system_content),
+-            HumanMessage(content=user_message),
+-        ]
++        initial_messages: list[BaseMessage] = [SystemMessage(content=system_content)]
++        for turn in history or []:
++            content = turn.get("content", "")
++            if turn.get("role") == "assistant":
++                initial_messages.append(AIMessage(content=content))
++            else:
++                initial_messages.append(HumanMessage(content=content))
++        initial_messages.append(HumanMessage(content=user_message))
+ 
+         # One guard instance per run, threaded through config so it persists
+         # across agent<->tool rounds within this single conversation turn.
+@@ -183,12 +203,16 @@ class ReActGraph:
+         with _span("react_graph.run", user_message_chars=len(user_message)):
+             result = await self._graph.ainvoke({"messages": initial_messages}, config=config)
+ 
++        result_messages = result.get("messages", [])
++
+         final = ""
+-        for msg in reversed(result.get("messages", [])):
++        for msg in reversed(result_messages):
+             if isinstance(msg, AIMessage) and msg.content:
+                 final = msg.content
+                 break
+ 
++        tool_calls = _extract_tool_call_trace(result_messages)
++
+         if conversation_memory is not None and final:
+             try:
+                 await conversation_memory.add_turn("user",      user_message)
+@@ -196,7 +220,7 @@ class ReActGraph:
+             except Exception as exc:
+                 logger.warning("ConversationMemory.add_turn() failed: %s", exc)
+ 
+-        return final
++        return {"response": final, "tool_calls": tool_calls}
+ 
+     def _build(self) -> Any:
+         g = StateGraph(MessagesState)
+@@ -288,7 +312,7 @@ async def _tool_node(state: MessagesState, config: RunnableConfig | None = None)
+         with _span("react_graph.tool_call", tool_name=name):
+             result = await call_tool(name, args, mcp_url=mcp_url)
+ 
+-        success = not result.startswith("[MCP ERROR]")
++        success = not _is_tool_error(result)
+         if guard is not None:
+             guard.record_result(name, args, success=success, result=result)
+ 
+@@ -300,8 +324,7 @@ async def _tool_node(state: MessagesState, config: RunnableConfig | None = None)
+         )
+ 
+     for tm in tool_messages:
+-        status = "OK" if not (tm.content.startswith("[MCP ERROR]")
+-                              or tm.content.startswith("[BLOCKED]")) else "FAILED/BLOCKED"
++        status = "OK" if not _is_tool_error(tm.content) else "FAILED/BLOCKED"
+         logger.info("Tool %s: %s (%d chars)", tm.name, status, len(tm.content))
+ 
+     return {"messages": tool_messages}
+@@ -347,6 +370,39 @@ def _trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+     return [system, summary, *recent]
+ 
+ 
++def _extract_tool_call_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
++    """
++    Walks the full message trace from one graph run and pairs each
++    AIMessage tool_call with its matching ToolMessage result by
++    tool_call_id, in call order. This is exactly the data the graph
++    already produces each round internally -- the only thing that was
++    missing before was returning it instead of discarding everything but
++    the final AIMessage's text.
++    """
++    results_by_id: dict[str, ToolMessage] = {
++        m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)
++    }
++
++    trace: list[dict[str, Any]] = []
++    for msg in messages:
++        if not (isinstance(msg, AIMessage) and msg.tool_calls):
++            continue
++        for tc in msg.tool_calls:
++            call_id = tc.get("id", "")
++            result_msg = results_by_id.get(call_id)
++            result_text = result_msg.content if result_msg is not None else ""
++            trace.append(
++                {
++                    "id": call_id,
++                    "name": tc.get("name", ""),
++                    "args": tc.get("args") or {},
++                    "result": result_text,
++                    "ok": not _is_tool_error(result_text),
++                }
++            )
++    return trace
++
++
+ def _get_llm_from_config(cfg: dict) -> ChatOllama:
+     llm = cfg.get("llm")
+     if llm is not None:
+diff --git a/backend/api/routes/agent.py b/backend/api/routes/agent.py
+index 3322e39..2f10266 100644
+--- a/backend/api/routes/agent.py
++++ b/backend/api/routes/agent.py
+@@ -11,6 +11,7 @@ POST /api/agent/react         — ReAct loop with native function calling (MCP-b
+ from __future__ import annotations
+ 
+ import logging
++from typing import Literal
+ 
+ from fastapi import APIRouter, HTTPException, Request
+ from pydantic import BaseModel
+@@ -54,13 +55,42 @@ class ToolExecuteResponse(BaseModel):
+     results: list[dict]
+ 
+ 
++class ChatTurnIn(BaseModel):
++    role: Literal["user", "assistant"]
++    content: str
++
++
+ class ReactRequest(BaseModel):
+-    message: str
++    # `message` (single string, no history) is kept only for backward
++    # compatibility with callers that predate multi-turn support
++    # (test-paeka-api.ps1, the README curl example). `messages` (full
++    # history, last entry is the new turn) is the shape the rwp chat UI
++    # actually sends, and is preferred when both are present.
++    message: str | None = None
++    messages: list[ChatTurnIn] | None = None
+     max_rounds: int = 10
+ 
++    def resolve_turn(self) -> tuple[str, list[dict[str, str]]]:
++        """Returns (latest_user_message, prior_history) regardless of which shape the caller used."""
++        if self.messages:
++            history = [m.model_dump() for m in self.messages[:-1]]
++            return self.messages[-1].content, history
++        if self.message is not None:
++            return self.message, []
++        raise ValueError("Either 'message' or 'messages' is required.")
++
++
++class ToolCallTrace(BaseModel):
++    id: str
++    name: str
++    args: dict
++    result: str
++    ok: bool
++
+ 
+ class ReactResponse(BaseModel):
+     response: str
++    tool_calls: list[ToolCallTrace] = []
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -180,13 +210,23 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
+     and its latency, and any guardrail trips -- is visible in the trace.
+     This is the endpoint to hit to verify the loop end-to-end.
+ 
+-    Example:
++    Example (single-turn, no history):
+         curl -X POST http://localhost:8000/api/agent/react \\
+              -H "Content-Type: application/json" \\
+              -d '{"message": "What tools do you have available?"}'
++
++    Example (multi-turn, preferred -- mirrors /v1/chat/completions' shape):
++        curl -X POST http://localhost:8000/api/agent/react \\
++             -H "Content-Type: application/json" \\
++             -d '{"messages": [{"role": "user", "content": "What tools do you have available?"}]}'
+     """
+     from backend.agent.react_graph import ReActGraph
+ 
++    try:
++        user_message, history = body.resolve_turn()
++    except ValueError as exc:
++        raise HTTPException(status_code=422, detail=str(exc)) from exc
++
+     llm = getattr(request.app.state, "llm", None)
+     if llm is None:
+         raise HTTPException(
+@@ -210,13 +250,13 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
+         )
+ 
+     graph = ReActGraph(llm=chat_ollama, max_rounds=min(body.max_rounds, 15))
+-    response_text = await graph.run(user_message=body.message)
++    result = await graph.run(user_message=user_message, history=history)
+ 
+-    if not response_text:
++    if not result["response"]:
+         raise HTTPException(
+             status_code=502,
+             detail="ReAct loop completed with no final text response. "
+                    "Check logs/logfire trace for what happened in each round.",
+         )
+ 
+-    return ReactResponse(response=response_text)
++    return ReactResponse(response=result["response"], tool_calls=result["tool_calls"])
+diff --git a/rwp/bun.lock b/rwp/bun.lock
+index 2869009..53a4bca 100644
+--- a/rwp/bun.lock
++++ b/rwp/bun.lock
+@@ -8,7 +8,12 @@
+         "@ai-sdk/openai-compatible": "^3.0.0",
+         "@ai-sdk/provider-utils": "^5.0.0",
+         "@ai-sdk/svelte": "^5.0.3",
++        "@vscode/markdown-it-katex": "^1.1.2",
+         "ai": "^7.0.3",
++        "dompurify": "^3.4.11",
++        "highlight.js": "^11.11.1",
++        "katex": "^0.17.0",
++        "markdown-it": "^14.2.0",
+       },
+       "devDependencies": {
+         "@sveltejs/vite-plugin-svelte": "^7.1.2",
+@@ -16,6 +21,8 @@
+         "@testing-library/svelte": "^5.4.2",
+         "@testing-library/user-event": "^14.5.2",
+         "@tsconfig/svelte": "^5.0.4",
++        "@types/dompurify": "^3.2.0",
++        "@types/markdown-it": "^14.1.2",
+         "jsdom": "^29.1.1",
+         "svelte": "^5.56.4",
+         "svelte-check": "^4.1.1",
+@@ -148,8 +155,16 @@
+ 
+     "@types/deep-eql": ["@types/deep-eql@4.0.2", "", {}, "sha512-c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw=="],
+ 
++    "@types/dompurify": ["@types/dompurify@3.2.0", "", { "dependencies": { "dompurify": "*" } }, "sha512-Fgg31wv9QbLDA0SpTOXO3MaxySc4DKGLi8sna4/Utjo4r3ZRPdCt4UQee8BWr+Q5z21yifghREPJGYaEOEIACg=="],
++
+     "@types/estree": ["@types/estree@1.0.9", "", {}, "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg=="],
+ 
++    "@types/linkify-it": ["@types/linkify-it@5.0.0", "", {}, "sha512-sVDA58zAw4eWAffKOaQH5/5j3XeayukzDk+ewSsnv3p4yJEZHCCzMDiZM8e0OUrRvmpGZ85jf4yDHkHsgBNr9Q=="],
++
++    "@types/markdown-it": ["@types/markdown-it@14.1.2", "", { "dependencies": { "@types/linkify-it": "^5", "@types/mdurl": "^2" } }, "sha512-promo4eFwuiW+TfGxhi+0x3czqTYJkG8qB17ZUJiVF10Xm7NLVRSLUsfRTU/6h1e24VvRnXCx+hG7li58lkzog=="],
++
++    "@types/mdurl": ["@types/mdurl@2.0.0", "", {}, "sha512-RGdgjQUZba5p6QEFAVx2OGb8rQDL/cPRG7GiedRzMcJ1tYnUANBncjbSB1NRGwbvjcPeikRABz2nshyPk1bhWg=="],
++
+     "@types/trusted-types": ["@types/trusted-types@2.0.7", "", {}, "sha512-ScaPdn1dQczgbl0QFTeTOmVHFULt394XJgOQNoyVhZ6r2vLnMLJfBPd53SB52T/3G36VI1/g2MZaX0cwDuXsfw=="],
+ 
+     "@vercel/oidc": ["@vercel/oidc@3.2.0", "", {}, "sha512-UycprH3T6n3jH0k44NHMa7pnFHGu/N05MjojYr+Mc6I7obkoLIJujSWwin1pCvdy/eOxrI/l3uDLQsmcrOb4ug=="],
+@@ -168,6 +183,8 @@
+ 
+     "@vitest/utils": ["@vitest/utils@4.1.9", "", { "dependencies": { "@vitest/pretty-format": "4.1.9", "convert-source-map": "^2.0.0", "tinyrainbow": "^3.1.0" } }, "sha512-A51o8ymO5PpqlWNnBP9ZHPXDIpuMtTLlGSjN7la4US+LJzoUMyhwjA5QXlm39JexgwHKW4Xjs8Z2d3dLCXOeuA=="],
+ 
++    "@vscode/markdown-it-katex": ["@vscode/markdown-it-katex@1.1.2", "", { "dependencies": { "katex": "^0.16.4" } }, "sha512-+4IIv5PgrmhKvW/3LpkpkGg257OViEhXkOOgCyj5KMsjsOfnRXkni8XAuuF9Ui5p3B8WnUovlDXAQNb8RJ/RaQ=="],
++
+     "@workflow/serde": ["@workflow/serde@4.1.0", "", {}, "sha512-pav4F2BoirECWR7Nf1TKt+2eETcBj7jj4cBefQ8VXQCA6NPkaKeLfj/zMgi+3zYV5ZIBT4GuUiphsj0/b9hPQQ=="],
+ 
+     "acorn": ["acorn@8.17.0", "", { "bin": { "acorn": "bin/acorn" } }, "sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg=="],
+@@ -178,6 +195,8 @@
+ 
+     "ansi-styles": ["ansi-styles@5.2.0", "", {}, "sha512-Cxwpt2SfTzTtXcfOlzGEee8O+c+MmUgGrNiBcXnuWxuFJHe6a5Hz7qwhwe5OgaSYI0IJvkLqWX1ASG+cJOkEiA=="],
+ 
++    "argparse": ["argparse@2.0.1", "", {}, "sha512-8+9WqebbFzpX9OR+Wa6O29asIogeRMzcGtAINdpMHHyAg10f05aSFVBbcEqGf/PXw1EjAZ+q2/bEBg3DvurK3Q=="],
++
+     "aria-query": ["aria-query@5.3.2", "", {}, "sha512-COROpnaoap1E2F000S62r6A60uHZnmlvomhfyT2DlTcrY1OrBKn2UhH7qn5wTC9zMvD0AY7csdPSNwKP+7WiQw=="],
+ 
+     "assertion-error": ["assertion-error@2.0.1", "", {}, "sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA=="],
+@@ -192,6 +211,8 @@
+ 
+     "clsx": ["clsx@2.1.1", "", {}, "sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA=="],
+ 
++    "commander": ["commander@8.3.0", "", {}, "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww=="],
++
+     "convert-source-map": ["convert-source-map@2.0.0", "", {}, "sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg=="],
+ 
+     "css-tree": ["css-tree@3.2.1", "", { "dependencies": { "mdn-data": "2.27.1", "source-map-js": "^1.2.1" } }, "sha512-X7sjQzceUhu1u7Y/ylrRZFU2FS6LRiFVp6rKLPg23y3x3c3DOKAwuXGDp+PAGjh6CSnCjYeAul8pcT8bAl+lSA=="],
+@@ -212,7 +233,9 @@
+ 
+     "dom-accessibility-api": ["dom-accessibility-api@0.6.3", "", {}, "sha512-7ZgogeTnjuHbo+ct10G9Ffp0mif17idi0IyWNVA/wcwcm7NPOD/WEHVP3n7n3MhXqxoIYm8d6MuZohYWIZ4T3w=="],
+ 
+-    "entities": ["entities@8.0.0", "", {}, "sha512-zwfzJecQ/Uej6tusMqwAqU/6KL2XaB2VZ2Jg54Je6ahNBGNH6Ek6g3jjNCF0fG9EWQKGZNddNjU5F1ZQn/sBnA=="],
++    "dompurify": ["dompurify@3.4.11", "", { "optionalDependencies": { "@types/trusted-types": "^2.0.7" } }, "sha512-zhlUV12GsaRzMsf9q5M254YhA4+VuF0fG+QFqu6aYpoGlKtz+w8//jBcGVYBgQkR5GHjUomejY84AV+/uPbWdw=="],
++
++    "entities": ["entities@4.5.0", "", {}, "sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw=="],
+ 
+     "es-module-lexer": ["es-module-lexer@2.1.0", "", {}, "sha512-n27zTYMjYu1aj4MjCWzSP7G9r75utsaoc8m61weK+W8JMBGGQybd43GstCXZ3WNmSFtGT9wi59qQTW6mhTR5LQ=="],
+ 
+@@ -230,6 +253,8 @@
+ 
+     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
+ 
++    "highlight.js": ["highlight.js@11.11.1", "", {}, "sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w=="],
++
+     "html-encoding-sniffer": ["html-encoding-sniffer@6.0.0", "", { "dependencies": { "@exodus/bytes": "^1.6.0" } }, "sha512-CV9TW3Y3f8/wT0BRFc1/KAVQ3TUHiXmaAb6VW9vtiMFf7SLoMd1PdAc4W3KFOFETBJUb90KatHqlsZMWV+R9Gg=="],
+ 
+     "indent-string": ["indent-string@4.0.0", "", {}, "sha512-EdDDZu4A2OyIK7Lr/2zG+w5jmbuk1DVBnEwREQvBzspBJkCEbRa8GxU1lghYcaGJCnRWibjDXlq779X1/y5xwg=="],
+@@ -244,6 +269,8 @@
+ 
+     "json-schema": ["json-schema@0.4.0", "", {}, "sha512-es94M3nTIfsEPisRafak+HDLfHXnKBhV3vU5eqPcS3flIWqcxJWgXHXiey3YrpaNsanY5ei1VoYEbOzijuq9BA=="],
+ 
++    "katex": ["katex@0.17.0", "", { "dependencies": { "commander": "^8.3.0" }, "bin": { "katex": "cli.js" } }, "sha512-Vdw0ATsQ9V+LuegM/BTwQqV/6cTl5lbGcIrU+BCgLxyf6bo38ybOr372tuSIxir3CN720flu1meYR6XzNMwQnw=="],
++
+     "lightningcss": ["lightningcss@1.32.0", "", { "dependencies": { "detect-libc": "^2.0.3" }, "optionalDependencies": { "lightningcss-android-arm64": "1.32.0", "lightningcss-darwin-arm64": "1.32.0", "lightningcss-darwin-x64": "1.32.0", "lightningcss-freebsd-x64": "1.32.0", "lightningcss-linux-arm-gnueabihf": "1.32.0", "lightningcss-linux-arm64-gnu": "1.32.0", "lightningcss-linux-arm64-musl": "1.32.0", "lightningcss-linux-x64-gnu": "1.32.0", "lightningcss-linux-x64-musl": "1.32.0", "lightningcss-win32-arm64-msvc": "1.32.0", "lightningcss-win32-x64-msvc": "1.32.0" } }, "sha512-NXYBzinNrblfraPGyrbPoD19C1h9lfI/1mzgWYvXUTe414Gz/X1FD2XBZSZM7rRTrMA8JL3OtAaGifrIKhQ5yQ=="],
+ 
+     "lightningcss-android-arm64": ["lightningcss-android-arm64@1.32.0", "", { "os": "android", "cpu": "arm64" }, "sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg=="],
+@@ -268,6 +295,8 @@
+ 
+     "lightningcss-win32-x64-msvc": ["lightningcss-win32-x64-msvc@1.32.0", "", { "os": "win32", "cpu": "x64" }, "sha512-Amq9B/SoZYdDi1kFrojnoqPLxYhQ4Wo5XiL8EVJrVsB8ARoC1PWW6VGtT0WKCemjy8aC+louJnjS7U18x3b06Q=="],
+ 
++    "linkify-it": ["linkify-it@5.0.1", "", { "dependencies": { "uc.micro": "^2.0.0" } }, "sha512-wVoTjP4Q6R0NW5hiZkVJaFZPWgtXfoGF+6LucL3/FtiNjmcHhYjEr5f1Kqjirc1nBW07J/ZuRFumqr2oqccEWg=="],
++
+     "locate-character": ["locate-character@3.0.0", "", {}, "sha512-SW13ws7BjaeJ6p7Q6CO2nchbYEc3X3J6WrmTTDto7yMPqVSZTUyY5Tjbid+Ab8gLnATtygYtiDIJGQRRn2ZOiA=="],
+ 
+     "lru-cache": ["lru-cache@11.5.1", "", {}, "sha512-RPimw/7aMdv2oqRrxKwvZXcPfwBrn/JZ2xYcY9Hus/6LaS3VOAKVWKWgNLCFSiOm1ESXinjsDlidVU7JlnCN2A=="],
+@@ -276,8 +305,12 @@
+ 
+     "magic-string": ["magic-string@0.30.21", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.5" } }, "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ=="],
+ 
++    "markdown-it": ["markdown-it@14.2.0", "", { "dependencies": { "argparse": "^2.0.1", "entities": "^4.4.0", "linkify-it": "^5.0.1", "mdurl": "^2.0.0", "punycode.js": "^2.3.1", "uc.micro": "^2.1.0" }, "bin": { "markdown-it": "bin/markdown-it.mjs" } }, "sha512-1TGiQiJVRQ3NPmZH6sx5Cfnmg6GQm9jvC1ch4TK511NjSJvjzKLzn5pPfZRNZkRPZP0HqCioSndqH8v2nRaWVQ=="],
++
+     "mdn-data": ["mdn-data@2.27.1", "", {}, "sha512-9Yubnt3e8A0OKwxYSXyhLymGW4sCufcLG6VdiDdUGVkPhpqLxlvP5vl1983gQjJl3tqbrM731mjaZaP68AgosQ=="],
+ 
++    "mdurl": ["mdurl@2.0.0", "", {}, "sha512-Lf+9+2r+Tdp5wXDXC4PcIBjTDtq4UKjCPMQhKIuzpJNW0b96kVqSwW0bT7FhRSfmAiFYgP+SCRvdrDozfh0U5w=="],
++
+     "min-indent": ["min-indent@1.0.1", "", {}, "sha512-I9jwMn07Sy/IwOj3zVkVik2JTvgpaykDZEigL6Rx6N9LbMywwUSMtxET+7lVoDLLd3O3IXwJwvuuns8UB/HeAg=="],
+ 
+     "mri": ["mri@1.2.0", "", {}, "sha512-tzzskb3bG8LvYGFF/mDTpq3jpI6Q9wc3LEmBaghu+DdCssd1FakN7Bc0hVNmEyGq1bq3RgfkCb3cmQLpNPOroA=="],
+@@ -300,6 +333,8 @@
+ 
+     "punycode": ["punycode@2.3.1", "", {}, "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg=="],
+ 
++    "punycode.js": ["punycode.js@2.3.1", "", {}, "sha512-uxFIHU0YlHYhDQtV4R9J6a52SLx28BCjT+4ieh7IGbgwVJWO+km431c4yRlREUAsAmt/uMjQUyQHNEPf0M39CA=="],
++
+     "react-is": ["react-is@17.0.2", "", {}, "sha512-w2GsyukL62IJnlaff/nRegPQR94C/XXamvMWmSHRJ4y7Ts/4ocGRmTHvOs8PSE6pB3dWOrD/nueuU5sduBsQ4w=="],
+ 
+     "readdirp": ["readdirp@4.1.2", "", {}, "sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg=="],
+@@ -350,6 +385,8 @@
+ 
+     "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
+ 
++    "uc.micro": ["uc.micro@2.1.0", "", {}, "sha512-ARDJmphmdvUk6Glw7y9DQ2bFkKBHwQHLi2lsaH6PPmz/Ka9sFOBsBluozhDltWmnv9u/cF6Rt87znRTPV+yp/A=="],
++
+     "undici": ["undici@7.28.0", "", {}, "sha512-cRZYrTDwWznlnRiPjggAGxZXanty6M8RV1ff8Wm4LWXBp7/IG8v5DnOm74DtUBp9OONpK75YlPnIjQqX0dBDtA=="],
+ 
+     "vite": ["vite@8.1.0", "", { "dependencies": { "lightningcss": "^1.32.0", "picomatch": "^4.0.4", "postcss": "^8.5.15", "rolldown": "~1.1.2", "tinyglobby": "^0.2.17" }, "optionalDependencies": { "fsevents": "~2.3.3" }, "peerDependencies": { "@types/node": "^20.19.0 || >=22.12.0", "@vitejs/devtools": "^0.3.0", "esbuild": "^0.27.0 || ^0.28.0", "jiti": ">=1.21.0", "less": "^4.0.0", "sass": "^1.70.0", "sass-embedded": "^1.70.0", "stylus": ">=0.54.8", "sugarss": "^5.0.0", "terser": "^5.16.0", "tsx": "^4.8.1", "yaml": "^2.4.2" }, "optionalPeers": ["@types/node", "@vitejs/devtools", "esbuild", "jiti", "less", "sass", "sass-embedded", "stylus", "sugarss", "terser", "tsx", "yaml"], "bin": { "vite": "bin/vite.js" } }, "sha512-BuJcQK/56NQTWDGn4ABea3q4SSBdNPWwNZKTkkUpcMPnLoquSYH8llRtSUIgoL1KSCpHt5eghLShn50mH36y7Q=="],
+@@ -380,6 +417,10 @@
+ 
+     "@testing-library/dom/dom-accessibility-api": ["dom-accessibility-api@0.5.16", "", {}, "sha512-X7BJ2yElsnOJ30pZF4uIIDfBEVgF4XEBxL9Bxhy6dnrm5hkzqmsWHGTiHqRiITNhMyFLyAiWndIJP7Z1NTteDg=="],
+ 
++    "@vscode/markdown-it-katex/katex": ["katex@0.16.47", "", { "dependencies": { "commander": "^8.3.0" }, "bin": { "katex": "cli.js" } }, "sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg=="],
++
++    "parse5/entities": ["entities@8.0.0", "", {}, "sha512-zwfzJecQ/Uej6tusMqwAqU/6KL2XaB2VZ2Jg54Je6ahNBGNH6Ek6g3jjNCF0fG9EWQKGZNddNjU5F1ZQn/sBnA=="],
++
+     "svelte/aria-query": ["aria-query@5.3.1", "", {}, "sha512-Z/ZeOgVl7bcSYZ/u/rh0fOpvEpq//LZmdbkXyc7syVzjPAhfOa9ebsdTSjEBDU4vs5nC98Kfduj1uFo0qyET3g=="],
+   }
+ }
+diff --git a/rwp/package.json b/rwp/package.json
+index bda1665..9e36e8d 100644
+--- a/rwp/package.json
++++ b/rwp/package.json
+@@ -10,7 +10,9 @@
+     "preview": "vite preview",
+     "check": "svelte-check --tsconfig ./tsconfig.json",
+     "test": "vitest run",
+-    "test:watch": "vitest"
++    "test:watch": "vitest",
++    "smoke-test": "node scripts/smoke-test-bundle.mjs",
++    "verify": "bun run test && bun run check && bun run build && bun run smoke-test"
+   },
+   "devDependencies": {
+     "@sveltejs/vite-plugin-svelte": "^7.1.2",
+@@ -18,6 +20,8 @@
+     "@testing-library/svelte": "^5.4.2",
+     "@testing-library/user-event": "^14.5.2",
+     "@tsconfig/svelte": "^5.0.4",
++    "@types/dompurify": "^3.2.0",
++    "@types/markdown-it": "^14.1.2",
+     "jsdom": "^29.1.1",
+     "svelte": "^5.56.4",
+     "svelte-check": "^4.1.1",
+@@ -29,6 +33,11 @@
+     "@ai-sdk/openai-compatible": "^3.0.0",
+     "@ai-sdk/provider-utils": "^5.0.0",
+     "@ai-sdk/svelte": "^5.0.3",
+-    "ai": "^7.0.3"
++    "@vscode/markdown-it-katex": "^1.1.2",
++    "ai": "^7.0.3",
++    "dompurify": "^3.4.11",
++    "highlight.js": "^11.11.1",
++    "katex": "^0.17.0",
++    "markdown-it": "^14.2.0"
+   }
+ }
+diff --git a/rwp/scripts/smoke-test-bundle.mjs b/rwp/scripts/smoke-test-bundle.mjs
+new file mode 100644
+index 0000000..e983739
+--- /dev/null
++++ b/rwp/scripts/smoke-test-bundle.mjs
+@@ -0,0 +1,103 @@
++#!/usr/bin/env node
++/**
++ * scripts/smoke-test-bundle.mjs
++ * ===============================
++ * Executes the real built dist/assets/*.js bundle under jsdom and
++ * asserts it actually mounts content into #app.
++ *
++ * Why this exists, not just `vitest run` and `vite build`:
++ * - `vite build` only checks that the bundle is syntactically valid and
++ *   that all imports resolve to *something*. It does not execute any of
++ *   the resulting code, so it cannot catch a value being the wrong
++ *   *shape* at runtime.
++ * - `vitest run` executes real code, but through Vitest's own
++ *   Node-based module resolution -- which can (and, for at least one
++ *   real dependency in this app, did) resolve a CJS package's default
++ *   export to a different shape than Vite's production rolldown
++ *   bundler does for the exact same import statement. Every test was
++ *   green while the real built app threw on load.
++ *
++ * This script closes that gap by actually running the same JS a
++ * browser would load, just with jsdom standing in for the DOM. It is
++ * intentionally not a full browser (no real layout/paint), but it
++ * executes every line of top-level module code and the initial mount,
++ * which is exactly where this category of bug lives.
++ *
++ * Usage: bun run build && node scripts/smoke-test-bundle.mjs
++ */
++
++import { JSDOM } from "jsdom";
++import { readdirSync } from "fs";
++import path from "path";
++import { fileURLToPath } from "url";
++
++const rwpRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
++const assetsDir = path.join(rwpRoot, "dist", "assets");
++
++const jsFile = readdirSync(assetsDir).find((f) => f.endsWith(".js"));
++if (!jsFile) {
++  console.error(`No built .js bundle found in ${assetsDir}. Run "bun run build" first.`);
++  process.exit(1);
++}
++
++const dom = new JSDOM('<!doctype html><html><body><div id="app"></div></body></html>', {
++  url: "http://localhost/",
++  pretendToBeVisual: true,
++});
++
++// Only the globals real-world dependencies in this app have turned out
++// to touch at module-load/initial-mount time. If a future dependency
++// needs another one, the error message naming it is the signal to add
++// it here -- that's a sign this script is doing its job, not that it's
++// broken.
++const GLOBALS_TO_BRIDGE = [
++  "window", "document", "navigator", "localStorage",
++  "HTMLElement", "Element", "Node", "Text", "Comment",
++  "MutationObserver", "EventTarget", "DocumentFragment", "SVGElement",
++  "HTMLMediaElement", "Event", "CustomEvent", "KeyboardEvent", "MouseEvent",
++];
++for (const key of GLOBALS_TO_BRIDGE) {
++  if (dom.window[key] !== undefined) {
++    Object.defineProperty(global, key, { value: dom.window[key], configurable: true });
++  }
++}
++global.requestAnimationFrame = (cb) => setTimeout(cb, 0);
++global.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
++global.window.matchMedia = global.matchMedia;
++
++let failed = false;
++
++try {
++  await import(path.join(assetsDir, jsFile));
++  // Mounting involves a microtask hop or two (Svelte effects flush
++  // async); give it a moment before inspecting the result.
++  await new Promise((resolve) => setTimeout(resolve, 300));
++
++  const app = document.getElementById("app");
++  const html = app?.innerHTML ?? "";
++
++  check("the bundle executed without throwing", true);
++  check("#app has mounted content (not blank)", html.length > 0);
++  check('TopNav rendered ("Chat" tab present)', html.includes(">Chat<"));
++  check('ChatWindow rendered ("Research Assistant" header present)', html.includes("Research Assistant"));
++} catch (err) {
++  failed = true;
++  console.error("✗ Bundle threw during execution:\n");
++  console.error(err.stack || err);
++}
++
++function check(label, ok) {
++  if (ok) {
++    console.log(`✓ ${label}`);
++  } else {
++    failed = true;
++    console.log(`✗ ${label}`);
++  }
++}
++
++if (failed) {
++  console.error("\nSmoke test FAILED -- the production bundle does not mount correctly.");
++  process.exit(1);
++} else {
++  console.log("\nSmoke test passed.");
++}
+diff --git a/rwp/src/App.svelte b/rwp/src/App.svelte
+index 241abfd..e31e6d1 100644
+--- a/rwp/src/App.svelte
++++ b/rwp/src/App.svelte
+@@ -1,6 +1,34 @@
+ <script lang="ts">
+   import "./app.css";
++  import TopNav from "./lib/components/TopNav.svelte";
+   import ChatWindow from "./lib/components/ChatWindow.svelte";
+ </script>
+ 
+-<ChatWindow />
++<div class="app-shell">
++  <div class="app-shell__nav">
++    <TopNav />
++  </div>
++  <div class="app-shell__content">
++    <ChatWindow />
++  </div>
++</div>
++
++<style>
++  .app-shell {
++    display: flex;
++    flex-direction: column;
++    height: 100%;
++  }
++
++  .app-shell__nav {
++    flex: 0 0 auto;
++    padding: var(--space-3) var(--space-6) 0;
++    border-bottom: 1px solid var(--color-rule);
++    background: var(--color-paper-raised);
++  }
++
++  .app-shell__content {
++    flex: 1;
++    min-height: 0;
++  }
++</style>
+diff --git a/rwp/src/App.test.ts b/rwp/src/App.test.ts
+new file mode 100644
+index 0000000..d1e2e1d
+--- /dev/null
++++ b/rwp/src/App.test.ts
+@@ -0,0 +1,15 @@
++import { describe, it, expect } from "vitest";
++import { render } from "@testing-library/svelte";
++import App from "./App.svelte";
++
++describe("App (production mount diagnostic)", () => {
++  it("mounts with zero props, exactly as main.ts renders it, without throwing", () => {
++    expect(() => render(App)).not.toThrow();
++  });
++
++  it("renders TopNav and the chat header once mounted", () => {
++    const { getByText } = render(App);
++    expect(getByText("Chat")).toBeInTheDocument();
++    expect(getByText("Research Assistant")).toBeInTheDocument();
++  });
++});
+diff --git a/rwp/src/app.css b/rwp/src/app.css
+index 7786c6f..a10a139 100644
+--- a/rwp/src/app.css
++++ b/rwp/src/app.css
+@@ -19,6 +19,16 @@
+   --color-error: #a8472f;
+   --color-error-bg: #f6e8e3;
+ 
++  /* Code-block syntax colors deliberately reuse the two existing accent
++     inks (keyword/number) plus two new restrained hues (string/comment)
++     from the same warm-paper family, rather than importing an unrelated
++     six-color IDE theme -- see MessageBubble.svelte's :global() rules. */
++  --color-code-bg: #ece7da;
++  --color-code-keyword: var(--color-accent-user);
++  --color-code-number: var(--color-accent-assistant);
++  --color-code-string: #8a5a3b;
++  --color-code-comment: #8a8270;
++
+   --font-content: ui-serif, Georgia, "Source Serif Pro", serif;
+   --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+@@ -33,6 +43,27 @@
+   --radius: 3px;
+ }
+ 
++/* Dark variant of the same "reading room" palette -- same two inks
++   (sage/plum), same warm-paper hue family, just relit for low light.
++   Applied via a data-theme attribute on <html> (see lib/theme.ts) rather
++   than prefers-color-scheme alone, so the in-app toggle in TopNav can
++   override the system default and persist that choice. */
++:root[data-theme="dark"] {
++  --color-paper: #16140f;
++  --color-paper-raised: #1f1c15;
++  --color-ink: #ece6d8;
++  --color-ink-soft: #a39c8a;
++  --color-rule: #3a352a;
++  --color-accent-user: #8fb892;
++  --color-accent-assistant: #b4a0cf;
++  --color-error: #e0795c;
++  --color-error-bg: #3a2018;
++
++  --color-code-bg: #211e16;
++  --color-code-string: #d99a6c;
++  --color-code-comment: #6b6354;
++}
++
+ * {
+   box-sizing: border-box;
+ }
+@@ -44,6 +75,7 @@ body {
+   background: var(--color-paper);
+   color: var(--color-ink);
+   font-family: var(--font-ui);
++  transition: background-color 0.15s ease, color 0.15s ease;
+ }
+ 
+ #app {
+diff --git a/rwp/src/lib/ai/agent.test.ts b/rwp/src/lib/ai/agent.test.ts
+index 0b5ddea..9d78e9c 100644
+--- a/rwp/src/lib/ai/agent.test.ts
++++ b/rwp/src/lib/ai/agent.test.ts
+@@ -1,32 +1,24 @@
+-import { describe, it, expect, vi } from "vitest";
++import { describe, it, expect } from "vitest";
+ import { createAgentSession } from "./agent";
+-import { mockSseFetch } from "./test-helpers";
++import { mockJsonFetch } from "./test-helpers";
+ 
+ describe("createAgentSession", () => {
+   it("rejects an empty base URL", () => {
+-    expect(() => createAgentSession({ baseURL: "  ", model: "x" })).toThrow(/base URL/i);
+-  });
+-
+-  it("rejects an empty model", () => {
+-    expect(() =>
+-      createAgentSession({ baseURL: "http://localhost:8000/v1", model: "  " }),
+-    ).toThrow(/model/i);
++    expect(() => createAgentSession({ baseURL: "  " })).toThrow(/base URL/i);
+   });
+ 
+   it("starts with no messages", () => {
+     const chat = createAgentSession({
+       baseURL: "http://localhost:8000/v1",
+-      model: "paeka-qwen",
+-      fetch: mockSseFetch(["hi"]),
++      fetch: mockJsonFetch("hi"),
+     });
+     expect(chat.messages).toEqual([]);
+   });
+ 
+-  it("streams a real assistant reply through the full SDK pipeline", async () => {
++  it("sends a message and receives a real assistant reply through the full pipeline", async () => {
+     const chat = createAgentSession({
+       baseURL: "http://localhost:8000/v1",
+-      model: "paeka-qwen",
+-      fetch: mockSseFetch(["Hello", " there"]),
++      fetch: mockJsonFetch("Hello there"),
+     });
+ 
+     await chat.sendMessage({ text: "hi" });
+@@ -44,17 +36,29 @@ describe("createAgentSession", () => {
+     expect(assistantText).toBe("Hello there");
+   });
+ 
++  it("derives /api/agent/react from a baseURL ending in /v1", async () => {
++    const fetchMock = mockJsonFetch("ok");
++    const chat = createAgentSession({
++      baseURL: "http://localhost:8000/v1",
++      fetch: fetchMock,
++    });
++
++    await chat.sendMessage({ text: "hi" });
++
++    const [url] = (fetchMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
++    expect(url).toBe("http://localhost:8000/api/agent/react");
++  });
++
+   it("never sends an Authorization header when no apiKey is configured", async () => {
+-    const fetchMock = mockSseFetch(["ok"]);
++    const fetchMock = mockJsonFetch("ok");
+     const chat = createAgentSession({
+       baseURL: "http://localhost:8000/v1",
+-      model: "paeka-qwen",
+       fetch: fetchMock,
+     });
+ 
+     await chat.sendMessage({ text: "hi" });
+ 
+-    const [, init] = (fetchMock as ReturnType<typeof vi.fn>).mock.calls[0] as [
++    const [, init] = (fetchMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0] as [
+       string,
+       RequestInit,
+     ];
+diff --git a/rwp/src/lib/ai/agent.ts b/rwp/src/lib/ai/agent.ts
+index bc923c3..a551ac5 100644
+--- a/rwp/src/lib/ai/agent.ts
++++ b/rwp/src/lib/ai/agent.ts
+@@ -1,80 +1,58 @@
+-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+ import type { FetchFunction } from "@ai-sdk/provider-utils";
+-import { ToolLoopAgent, DirectChatTransport } from "ai";
+ import { Chat, type UIMessage } from "@ai-sdk/svelte";
++import { ReactAgentTransport } from "./reactTransport";
+ 
+ /**
+- * Configuration for a chat session against any OpenAI-compatible chat
+- * completions endpoint (Paeka's /v1/chat/completions satisfies this
+- * directly -- it proxies llama.cpp's own OpenAI-formatted SSE chunks
+- * through unchanged, see backend/api/routes/openai_compat.py).
++ * Configuration for a chat session against Paeka's own backend.
+  */
+ export interface AgentSessionConfig {
+-  /** Base URL up to and including /v1, e.g. "http://localhost:8000/v1". */
+-  baseURL: string;
+-  /** Model id as the backend expects it, e.g. "paeka-qwen". */
+-  model: string;
+-  /** Optional bearer token. Omit for backends that don't require one
+-   *  (e.g. a local Ollama-backed Paeka instance). */
+-  apiKey?: string;
+   /**
+-   * Optional system prompt override. Left undefined by default
+-   * deliberately -- Paeka already injects its own configured system
+-   * prompt server-side (see backend/llm/ollama.py's _inject_system())
+-   * when the first message isn't already a system message. Setting
+-   * this here would silently override that, which is more surprising
+-   * than useful for a "simple chat interface" talking to a backend
+-   * that already has its own persona configured.
++   * Base URL of the Paeka backend, e.g. "http://localhost:8000/v1" (the
++   * /v1 suffix, if present, is stripped -- kept accepting it in this shape
++   * for continuity with existing deployments/saved settings that predate
++   * the switch to /api/agent/react below).
+    */
+-  instructions?: string;
++  baseURL: string;
++  /** Optional bearer token. Omit for a local, unauthenticated instance. */
++  apiKey?: string;
+   /** Injectable for tests; real fetch is used if omitted. */
+   fetch?: FetchFunction;
+ }
+ 
+ /**
+  * [SEAM] This function is the one place that decides how chat messages
+- * actually get to a model. Today: a DirectChatTransport calling an
+- * OpenAI-compatible endpoint straight from the browser (no server
+- * route -- this is a plain Vite SPA, not SvelteKit, since the eventual
+- * Tauri shell wraps a static frontend with no Node runtime at all).
++ * actually get to a model. Talks to Paeka's bespoke /api/agent/react
++ * endpoint -- the LangGraph ReAct loop that actually executes MCP tools
++ * server-side -- via ReactAgentTransport, rather than the generic
++ * OpenAI-compatible passthrough at /v1/chat/completions (that endpoint
++ * exists for external clients like Terax; this UI now talks to the
++ * tool-executing agent directly so tool calls are visible here too).
+  *
+  * When the Tauri/Rust shell is added later (per the SAD's "Rust AI
+  * orchestrator" data-flow), this is the only place that needs to
+- * change -- swap DirectChatTransport for a custom ChatTransport that
+- * calls invoke('send_chat_message', ...) and adapts Tauri's event
+- * stream into a ReadableStream<UIMessageChunk>. Every component that
+- * consumes the returned Chat instance stays exactly as it is.
++ * change -- swap ReactAgentTransport for a transport that calls
++ * invoke('send_chat_message', ...) and adapts Tauri's event stream into
++ * a ReadableStream<UIMessageChunk>. Every component that consumes the
++ * returned Chat instance stays exactly as it is.
+  */
+ export function createAgentSession(config: AgentSessionConfig): Chat<UIMessage> {
+   const baseURL = config.baseURL.trim();
+-  const model = config.model.trim();
+-
+   if (!baseURL) {
+     throw new Error("Connection settings: base URL is required.");
+   }
+-  if (!model) {
+-    throw new Error("Connection settings: model is required.");
+-  }
+ 
+-  const provider = createOpenAICompatible({
+-    name: "rwp-openai-compatible",
+-    baseURL,
+-    apiKey: config.apiKey,
+-    fetch: config.fetch,
+-  });
+-
+-  const agent = new ToolLoopAgent({
+-    model: provider(model),
+-    instructions: config.instructions,
++  return new Chat({
++    transport: new ReactAgentTransport({
++      url: toReactEndpoint(baseURL),
++      apiKey: config.apiKey,
++      fetch: config.fetch,
++    }),
+   });
++}
+ 
+-  // [NOTE] TS generic-variance friction, not a runtime issue: with no
+-  // `tools` configured, ToolLoopAgent infers an empty tool set, which
+-  // produces a UIMessage sub-type TS won't unify with Chat's broader
+-  // default UITools generic. Runtime correctness is verified directly
+-  // by agent.test.ts/ChatWindow.test.ts (full streaming round-trip
+-  // through the real pipeline), not just asserted away here.
+-  return new Chat({
+-    transport: new DirectChatTransport({ agent }),
+-  }) as unknown as Chat<UIMessage>;
++/** "http://host:8000/v1" -> "http://host:8000/api/agent/react" (also tolerates a base URL with no /v1 suffix already present). */
++function toReactEndpoint(baseURL: string): string {
++  const trimmed = baseURL.replace(/\/+$/, "");
++  const root = trimmed.endsWith("/v1") ? trimmed.slice(0, -"/v1".length) : trimmed;
++  return `${root}/api/agent/react`;
+ }
+diff --git a/rwp/src/lib/ai/reactTransport.test.ts b/rwp/src/lib/ai/reactTransport.test.ts
+new file mode 100644
+index 0000000..3d43cbf
+--- /dev/null
++++ b/rwp/src/lib/ai/reactTransport.test.ts
+@@ -0,0 +1,179 @@
++import { describe, it, expect, vi } from "vitest";
++import { ReactAgentTransport } from "./reactTransport";
++import type { UIMessage, UIMessageChunk } from "ai";
++
++function jsonResponse(body: unknown, ok = true, status = 200): Response {
++  return {
++    ok,
++    status,
++    statusText: ok ? "OK" : "Error",
++    json: async () => body,
++    text: async () => JSON.stringify(body),
++  } as Response;
++}
++
++async function collect(stream: ReadableStream<UIMessageChunk>): Promise<UIMessageChunk[]> {
++  const reader = stream.getReader();
++  const out: UIMessageChunk[] = [];
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    out.push(value);
++  }
++  return out;
++}
++
++function userMessage(text: string): UIMessage {
++  return { id: "u1", role: "user", parts: [{ type: "text", text }] };
++}
++
++function assistantMessage(text: string): UIMessage {
++  return { id: "a1", role: "assistant", parts: [{ type: "text", text }] };
++}
++
++describe("ReactAgentTransport", () => {
++  it("posts the reconstructed {role, content} history to the configured url", async () => {
++    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ response: "hi", tool_calls: [] }));
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    await transport.sendMessages({
++      messages: [userMessage("hello"), assistantMessage("hi there"), userMessage("again")],
++      abortSignal: undefined,
++    });
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const [url, init] = fetchMock.mock.calls[0];
++    expect(url).toBe("http://localhost:8000/api/agent/react");
++    const body = JSON.parse(init.body as string);
++    expect(body.messages).toEqual([
++      { role: "user", content: "hello" },
++      { role: "assistant", content: "hi there" },
++      { role: "user", content: "again" },
++    ]);
++  });
++
++  it("omits the Authorization header when no apiKey is configured", async () => {
++    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ response: "hi", tool_calls: [] }));
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    await transport.sendMessages({ messages: [userMessage("hi")], abortSignal: undefined });
++
++    const [, init] = fetchMock.mock.calls[0];
++    expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
++  });
++
++  it("includes a bearer Authorization header when an apiKey is configured", async () => {
++    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ response: "hi", tool_calls: [] }));
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      apiKey: "secret",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    await transport.sendMessages({ messages: [userMessage("hi")], abortSignal: undefined });
++
++    const [, init] = fetchMock.mock.calls[0];
++    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer secret");
++  });
++
++  it("synthesizes tool-input-available/tool-output-available chunks before the final text", async () => {
++    const fetchMock = vi.fn().mockResolvedValue(
++      jsonResponse({
++        response: "The answer is 4.",
++        tool_calls: [
++          { id: "call_1", name: "calculator", args: { expr: "2+2" }, result: "4", ok: true },
++        ],
++      }),
++    );
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    const stream = await transport.sendMessages({
++      messages: [userMessage("what is 2+2?")],
++      abortSignal: undefined,
++    });
++    const chunks = await collect(stream);
++    const types = chunks.map((c) => c.type);
++
++    expect(types).toEqual([
++      "start",
++      "start-step",
++      "tool-input-available",
++      "tool-output-available",
++      "text-start",
++      "text-delta",
++      "text-end",
++      "finish-step",
++      "finish",
++    ]);
++
++    const toolInput = chunks.find((c) => c.type === "tool-input-available") as Extract<
++      UIMessageChunk,
++      { type: "tool-input-available" }
++    >;
++    expect(toolInput.toolName).toBe("calculator");
++    expect(toolInput.input).toEqual({ expr: "2+2" });
++
++    const textDelta = chunks.find((c) => c.type === "text-delta") as Extract<
++      UIMessageChunk,
++      { type: "text-delta" }
++    >;
++    expect(textDelta.delta).toBe("The answer is 4.");
++  });
++
++  it("emits tool-output-error (not tool-output-available) when a tool call failed", async () => {
++    const fetchMock = vi.fn().mockResolvedValue(
++      jsonResponse({
++        response: "I couldn't look that up.",
++        tool_calls: [
++          { id: "call_1", name: "web_search", args: {}, result: "[MCP ERROR] timeout", ok: false },
++        ],
++      }),
++    );
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    const stream = await transport.sendMessages({
++      messages: [userMessage("look this up")],
++      abortSignal: undefined,
++    });
++    const chunks = await collect(stream);
++
++    expect(chunks.some((c) => c.type === "tool-output-error")).toBe(true);
++    expect(chunks.some((c) => c.type === "tool-output-available")).toBe(false);
++    const errorChunk = chunks.find((c) => c.type === "tool-output-error") as Extract<
++      UIMessageChunk,
++      { type: "tool-output-error" }
++    >;
++    expect(errorChunk.errorText).toContain("MCP ERROR");
++  });
++
++  it("throws with response detail when the request fails", async () => {
++    const fetchMock = vi
++      .fn()
++      .mockResolvedValue(jsonResponse({ detail: "model not loaded" }, false, 503));
++    const transport = new ReactAgentTransport({
++      url: "http://localhost:8000/api/agent/react",
++      fetch: fetchMock as unknown as typeof fetch,
++    });
++
++    await expect(
++      transport.sendMessages({ messages: [userMessage("hi")], abortSignal: undefined }),
++    ).rejects.toThrow(/503/);
++  });
++
++  it("reconnectToStream always returns null (no resumable server-side stream)", async () => {
++    const transport = new ReactAgentTransport({ url: "http://localhost:8000/api/agent/react" });
++    await expect(transport.reconnectToStream()).resolves.toBeNull();
++  });
++});
+diff --git a/rwp/src/lib/ai/reactTransport.ts b/rwp/src/lib/ai/reactTransport.ts
+new file mode 100644
+index 0000000..4e2abaa
+--- /dev/null
++++ b/rwp/src/lib/ai/reactTransport.ts
+@@ -0,0 +1,158 @@
++import type { FetchFunction } from "@ai-sdk/provider-utils";
++import type { ChatRequestOptions, ChatTransport, UIMessage, UIMessageChunk } from "ai";
++
++export interface ReactTransportConfig {
++  /** Full URL to the endpoint, e.g. "http://localhost:8000/api/agent/react". */
++  url: string;
++  /** Optional bearer token, forwarded only if set. */
++  apiKey?: string;
++  /** Injectable for tests; real fetch is used if omitted. */
++  fetch?: FetchFunction;
++}
++
++interface ReactHistoryTurn {
++  role: "user" | "assistant";
++  content: string;
++}
++
++interface ToolCallTrace {
++  id: string;
++  name: string;
++  args: Record<string, unknown>;
++  result: string;
++  ok: boolean;
++}
++
++interface ReactApiResponse {
++  response: string;
++  tool_calls?: ToolCallTrace[];
++}
++
++/**
++ * [SEAM] Talks to Paeka's own /api/agent/react endpoint (the LangGraph
++ * ReAct loop that actually executes MCP tools server-side) instead of
++ * the generic OpenAI-compatible passthrough at /v1/chat/completions.
++ * That endpoint is a single request -> single JSON response, not a
++ * token stream, so this transport synthesizes one UIMessageChunk
++ * sequence from the whole response (tool calls, then final text) rather
++ * than relaying live deltas. The trade made here -- visible tool calls
++ * instead of live token-by-token streaming for this turn type -- was a
++ * deliberate choice, not an oversight; see PR description for the
++ * alternative considered (SSE streaming from react_graph.py) and why it
++ * was deferred.
++ */
++export class ReactAgentTransport implements ChatTransport<UIMessage> {
++  constructor(private readonly config: ReactTransportConfig) {}
++
++  async sendMessages(
++    options: {
++      messages: UIMessage[];
++      abortSignal: AbortSignal | undefined;
++    } & ChatRequestOptions,
++  ): Promise<ReadableStream<UIMessageChunk>> {
++    const fetchFn = this.config.fetch ?? fetch;
++    const history = toHistory(options.messages);
++
++    const headers: Record<string, string> = {
++      "Content-Type": "application/json",
++      ...(options.headers instanceof Headers
++        ? Object.fromEntries(options.headers.entries())
++        : options.headers ?? {}),
++    };
++    if (this.config.apiKey) {
++      headers.Authorization = `Bearer ${this.config.apiKey}`;
++    }
++
++    const res = await fetchFn(this.config.url, {
++      method: "POST",
++      headers,
++      body: JSON.stringify({ messages: history, ...options.body }),
++      signal: options.abortSignal,
++    });
++
++    if (!res.ok) {
++      const detail = await res.text().catch(() => "");
++      throw new Error(`Agent request failed (${res.status}): ${detail || res.statusText}`);
++    }
++
++    const data = (await res.json()) as ReactApiResponse;
++    return toChunkStream(data);
++  }
++
++  async reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
++    // The endpoint is a single synchronous request/response -- there is
++    // no server-side stream to resume after the fact.
++    return null;
++  }
++}
++
++/**
++ * Reconstructs the {role, content} history the backend expects from the
++ * UIMessage[] the AI SDK keeps client-side. Only text parts are sent --
++ * the backend doesn't need (and shouldn't need to re-parse) a previous
++ * turn's already-rendered tool-call trace to continue the conversation,
++ * only what was actually said.
++ */
++function toHistory(messages: UIMessage[]): ReactHistoryTurn[] {
++  return messages
++    .filter((m): m is UIMessage & { role: "user" | "assistant" } =>
++      m.role === "user" || m.role === "assistant",
++    )
++    .map((m) => ({
++      role: m.role,
++      content: m.parts
++        .filter((p): p is { type: "text"; text: string } => p.type === "text")
++        .map((p) => p.text)
++        .join(""),
++    }))
++    .filter((turn) => turn.content.length > 0);
++}
++
++function toChunkStream(data: ReactApiResponse): ReadableStream<UIMessageChunk> {
++  const chunks: UIMessageChunk[] = [{ type: "start" }, { type: "start-step" }];
++
++  for (const call of data.tool_calls ?? []) {
++    chunks.push({
++      type: "tool-input-available",
++      toolCallId: call.id,
++      toolName: call.name,
++      input: call.args,
++      dynamic: true,
++    });
++    chunks.push(
++      call.ok
++        ? {
++            type: "tool-output-available",
++            toolCallId: call.id,
++            output: call.result,
++            dynamic: true,
++          }
++        : {
++            type: "tool-output-error",
++            toolCallId: call.id,
++            errorText: call.result,
++            dynamic: true,
++          },
++    );
++  }
++
++  // Single id is fine -- this is one non-streamed text segment per
++  // response, never multiple concurrent text parts.
++  const textId = "response";
++  chunks.push(
++    { type: "text-start", id: textId },
++    { type: "text-delta", id: textId, delta: data.response },
++    { type: "text-end", id: textId },
++    { type: "finish-step" },
++    { type: "finish" },
++  );
++
++  return new ReadableStream<UIMessageChunk>({
++    start(controller) {
++      for (const chunk of chunks) {
++        controller.enqueue(chunk);
++      }
++      controller.close();
++    },
++  });
++}
+diff --git a/rwp/src/lib/ai/test-helpers.ts b/rwp/src/lib/ai/test-helpers.ts
+index 1df7a89..6e0b881 100644
+--- a/rwp/src/lib/ai/test-helpers.ts
++++ b/rwp/src/lib/ai/test-helpers.ts
+@@ -1,46 +1,22 @@
+ import { vi } from "vitest";
+ 
++interface MockReactReply {
++  response: string;
++  tool_calls?: Array<{ id: string; name: string; args: Record<string, unknown>; result: string; ok: boolean }>;
++}
++
+ /**
+- * Builds a fetch mock that returns a real OpenAI-style SSE stream, so
+- * tests exercise the actual parsing path end to end rather than just
+- * asserting that functions were called with the right arguments.
++ * Builds a fetch mock returning the actual JSON shape /api/agent/react
++ * responds with, so tests exercise ReactAgentTransport's real parsing
++ * path end to end rather than just asserting functions were called with
++ * the right arguments.
+  */
+-export function mockSseFetch(deltas: string[]): typeof fetch {
+-  const lines: string[] = [];
+-  deltas.forEach((delta, i) => {
+-    lines.push(
+-      `data: ${JSON.stringify({
+-        id: "chatcmpl-test",
+-        object: "chat.completion.chunk",
+-        created: 1700000000,
+-        model: "test-model",
+-        choices: [
+-          {
+-            index: 0,
+-            delta: i === 0 ? { role: "assistant", content: delta } : { content: delta },
+-            finish_reason: null,
+-          },
+-        ],
+-      })}\n\n`,
+-    );
+-  });
+-  lines.push(
+-    `data: ${JSON.stringify({
+-      id: "chatcmpl-test",
+-      object: "chat.completion.chunk",
+-      created: 1700000000,
+-      model: "test-model",
+-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+-    })}\n\n`,
+-  );
+-  lines.push("data: [DONE]\n\n");
+-
+-  const body = lines.join("");
+-
++export function mockJsonFetch(reply: string | MockReactReply): typeof fetch {
++  const body: MockReactReply = typeof reply === "string" ? { response: reply, tool_calls: [] } : reply;
+   return vi.fn(async () =>
+-    new Response(body, {
++    new Response(JSON.stringify(body), {
+       status: 200,
+-      headers: { "Content-Type": "text/event-stream" },
++      headers: { "Content-Type": "application/json" },
+     }),
+   ) as unknown as typeof fetch;
+ }
+diff --git a/rwp/src/lib/components/ChatWindow.svelte b/rwp/src/lib/components/ChatWindow.svelte
+index 2bd358c..277d9b7 100644
+--- a/rwp/src/lib/components/ChatWindow.svelte
++++ b/rwp/src/lib/components/ChatWindow.svelte
+@@ -17,23 +17,21 @@
+   // ("state_referenced_locally") since it's also a common mistake when
+   // someone *did* want live reactivity; here it's intentional.
+   let baseURL = $state(initialConfig.baseURL ?? "http://localhost:8000/v1");
+-  let model = $state(initialConfig.model ?? "paeka-qwen");
+   let apiKey = $state(initialConfig.apiKey ?? "");
+ 
+   let chat = $state<Chat | undefined>(undefined);
+   let setupError: string | undefined = $state(undefined);
+ 
+   // Recreates the session whenever connection settings change. This is
+-  // deliberate -- switching backend/model mid-conversation makes the
+-  // existing history's relevance ambiguous, so starting fresh is the
+-  // less surprising behaviour. Lives in $effect (not $derived) because
++  // deliberate -- switching backend mid-conversation makes the existing
++  // history's relevance ambiguous, so starting fresh is the less
++  // surprising behaviour. Lives in $effect (not $derived) because
+   // constructing a Chat session is a side effect, not a pure computation.
+   $effect(() => {
+     setupError = undefined;
+     try {
+       chat = createAgentSession({
+         baseURL,
+-        model,
+         apiKey: apiKey || undefined,
+         fetch: initialConfig.fetch,
+       });
+@@ -47,9 +45,8 @@
+     void chat?.sendMessage({ text });
+   }
+ 
+-  function handleSaveSettings(values: { baseURL: string; model: string; apiKey: string }) {
++  function handleSaveSettings(values: { baseURL: string; apiKey: string }) {
+     baseURL = values.baseURL;
+-    model = values.model;
+     apiKey = values.apiKey;
+   }
+ 
+@@ -59,7 +56,7 @@
+ <div class="chat-window">
+   <header class="chat-window__header">
+     <h1 class="chat-window__title">Research Assistant</h1>
+-    <ConnectionSettings {baseURL} {model} {apiKey} onSave={handleSaveSettings} />
++    <ConnectionSettings {baseURL} {apiKey} onSave={handleSaveSettings} />
+   </header>
+ 
+   {#if setupError}
+diff --git a/rwp/src/lib/components/ChatWindow.test.ts b/rwp/src/lib/components/ChatWindow.test.ts
+index b767698..e074072 100644
+--- a/rwp/src/lib/components/ChatWindow.test.ts
++++ b/rwp/src/lib/components/ChatWindow.test.ts
+@@ -2,17 +2,16 @@ import { describe, it, expect } from "vitest";
+ import { render, screen } from "@testing-library/svelte";
+ import userEvent from "@testing-library/user-event";
+ import ChatWindow from "./ChatWindow.svelte";
+-import { mockSseFetch } from "../ai/test-helpers";
++import { mockJsonFetch } from "../ai/test-helpers";
+ 
+ describe("ChatWindow", () => {
+-  it("sends a message and renders the streamed assistant reply", async () => {
++  it("sends a message and renders the assistant reply", async () => {
+     const user = userEvent.setup();
+     render(ChatWindow, {
+       props: {
+         initialConfig: {
+           baseURL: "http://localhost:8000/v1",
+-          model: "paeka-qwen",
+-          fetch: mockSseFetch(["Hel", "lo!"]),
++          fetch: mockJsonFetch("Hello!"),
+         },
+       },
+     });
+@@ -23,7 +22,7 @@ describe("ChatWindow", () => {
+     expect(await screen.findByText("hi there")).toBeInTheDocument();
+     expect(await screen.findByText("Hello!")).toBeInTheDocument();
+ 
+-    // back to ready once the stream finishes -- input usable again
++    // back to ready once the response settles -- input usable again
+     expect(screen.getByLabelText("Message")).not.toBeDisabled();
+   });
+ 
+@@ -33,8 +32,7 @@ describe("ChatWindow", () => {
+       props: {
+         initialConfig: {
+           baseURL: "http://localhost:8000/v1",
+-          model: "paeka-qwen",
+-          fetch: mockSseFetch(["ok"]),
++          fetch: mockJsonFetch("ok"),
+         },
+       },
+     });
+@@ -49,9 +47,32 @@ describe("ChatWindow", () => {
+     expect(screen.getByLabelText("Message")).not.toBeDisabled();
+   });
+ 
++  it("renders a tool call distinctly from the final answer", async () => {
++    const user = userEvent.setup();
++    render(ChatWindow, {
++      props: {
++        initialConfig: {
++          baseURL: "http://localhost:8000/v1",
++          fetch: mockJsonFetch({
++            response: "It's 4.",
++            tool_calls: [
++              { id: "call_1", name: "calculator", args: { expr: "2+2" }, result: "4", ok: true },
++            ],
++          }),
++        },
++      },
++    });
++
++    await user.type(screen.getByLabelText("Message"), "what is 2+2?");
++    await user.keyboard("{Enter}");
++
++    expect(await screen.findByText("It's 4.")).toBeInTheDocument();
++    expect(screen.getByText("calculator")).toBeInTheDocument();
++  });
++
+   it("shows a setup error instead of the chat when configuration is invalid", () => {
+     render(ChatWindow, {
+-      props: { initialConfig: { baseURL: "", model: "paeka-qwen" } },
++      props: { initialConfig: { baseURL: "" } },
+     });
+     expect(screen.getByRole("alert")).toHaveTextContent(/base url/i);
+     expect(screen.queryByLabelText("Message")).not.toBeInTheDocument();
+diff --git a/rwp/src/lib/components/ConnectionSettings.svelte b/rwp/src/lib/components/ConnectionSettings.svelte
+index 6c41994..aa674ea 100644
+--- a/rwp/src/lib/components/ConnectionSettings.svelte
++++ b/rwp/src/lib/components/ConnectionSettings.svelte
+@@ -1,7 +1,6 @@
+ <script lang="ts">
+   interface SettingsValues {
+     baseURL: string;
+-    model: string;
+     apiKey: string;
+   }
+ 
+@@ -9,20 +8,18 @@
+     onSave: (values: SettingsValues) => void;
+   }
+ 
+-  let { baseURL, model, apiKey, onSave }: Props = $props();
++  let { baseURL, apiKey, onSave }: Props = $props();
+ 
+   let open = $state(false);
+   // One-time snapshot for editing, not a live binding -- see the same
+   // note in ChatWindow.svelte. Drafts only flow back via onSave.
+   let draftBaseURL = $state(baseURL);
+-  let draftModel = $state(model);
+   let draftApiKey = $state(apiKey);
+ 
+   function handleSubmit(event: SubmitEvent) {
+     event.preventDefault();
+     onSave({
+       baseURL: draftBaseURL.trim(),
+-      model: draftModel.trim(),
+       apiKey: draftApiKey.trim(),
+     });
+     open = false;
+@@ -36,10 +33,6 @@
+       <span>Base URL</span>
+       <input type="text" bind:value={draftBaseURL} placeholder="http://localhost:8000/v1" />
+     </label>
+-    <label class="settings__field">
+-      <span>Model</span>
+-      <input type="text" bind:value={draftModel} placeholder="paeka-qwen" />
+-    </label>
+     <label class="settings__field">
+       <span>API key (optional)</span>
+       <input
+diff --git a/rwp/src/lib/components/ConnectionSettings.test.ts b/rwp/src/lib/components/ConnectionSettings.test.ts
+index 0571812..5eefec6 100644
+--- a/rwp/src/lib/components/ConnectionSettings.test.ts
++++ b/rwp/src/lib/components/ConnectionSettings.test.ts
+@@ -9,7 +9,6 @@ describe("ConnectionSettings", () => {
+     render(ConnectionSettings, {
+       props: {
+         baseURL: "http://localhost:8000/v1",
+-        model: "paeka-qwen",
+         apiKey: "",
+         onSave: vi.fn(),
+       },
+@@ -19,24 +18,21 @@ describe("ConnectionSettings", () => {
+     expect(screen.getByPlaceholderText("http://localhost:8000/v1")).toHaveValue(
+       "http://localhost:8000/v1",
+     );
+-    expect(screen.getByPlaceholderText("paeka-qwen")).toHaveValue("paeka-qwen");
+   });
+ 
+   it("saves trimmed values and closes the panel", async () => {
+     const onSave = vi.fn();
+     const user = userEvent.setup();
+     render(ConnectionSettings, {
+-      props: { baseURL: "", model: "", apiKey: "", onSave },
++      props: { baseURL: "", apiKey: "", onSave },
+     });
+ 
+     await user.click(screen.getByText("Connection"));
+     await user.type(screen.getByPlaceholderText("http://localhost:8000/v1"), "  http://x/v1  ");
+-    await user.type(screen.getByPlaceholderText("paeka-qwen"), "  my-model  ");
+     await user.click(screen.getByRole("button", { name: "Save" }));
+ 
+     expect(onSave).toHaveBeenCalledExactlyOnceWith({
+       baseURL: "http://x/v1",
+-      model: "my-model",
+       apiKey: "",
+     });
+ 
+diff --git a/rwp/src/lib/components/MessageBubble.svelte b/rwp/src/lib/components/MessageBubble.svelte
+index eb6f59c..5fdf667 100644
+--- a/rwp/src/lib/components/MessageBubble.svelte
++++ b/rwp/src/lib/components/MessageBubble.svelte
+@@ -1,5 +1,7 @@
+ <script lang="ts">
+   import type { UIMessage } from "ai";
++  import { renderMarkdown } from "../markdown";
++  import ToolCallBlock from "./ToolCallBlock.svelte";
+ 
+   interface Props {
+     message: UIMessage;
+@@ -8,23 +10,64 @@
+ 
+   let { message, streaming = false }: Props = $props();
+ 
+-  const text = $derived(
+-    message.parts
+-      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+-      .map((p) => p.text)
+-      .join(""),
+-  );
+-
+   const roleLabel = $derived(message.role === "user" ? "You" : "Assistant");
++
++  // [SEAM] message.parts can interleave text and tool-call parts in
++  // stream order (text, then a tool call, then more text). Adjacent text
++  // parts are merged into one rendered block -- markdown-it needs a full
++  // paragraph's text to parse correctly, and rendering "Hello" / " world"
++  // as two separate <p> elements would visibly fragment a single sentence
++  // that just happened to arrive as two stream chunks. Anything that
++  // isn't text or a dynamic tool call (e.g. "step-start") is a structural
++  // stream marker, not content, and is intentionally skipped here.
++  type Segment =
++    | { kind: "text"; text: string; isLast: boolean }
++    | { kind: "tool"; part: Extract<UIMessage["parts"][number], { type: "dynamic-tool" }> };
++
++  const segments = $derived.by((): Segment[] => {
++    const result: Segment[] = [];
++    for (const part of message.parts) {
++      if (part.type === "text") {
++        const last = result[result.length - 1];
++        if (last && last.kind === "text") {
++          last.text += part.text;
++        } else {
++          result.push({ kind: "text", text: part.text, isLast: false });
++        }
++      } else if (part.type === "dynamic-tool") {
++        result.push({ kind: "tool", part });
++      }
++    }
++    for (let i = result.length - 1; i >= 0; i--) {
++      const seg = result[i];
++      if (seg.kind === "text") {
++        seg.isLast = true;
++        break;
++      }
++    }
++    return result;
++  });
+ </script>
+ 
+ <article class="message message--{message.role}" aria-label="{roleLabel} message">
+   <div class="message__rule" aria-hidden="true"></div>
+   <div class="message__body">
+     <p class="message__label">{roleLabel}</p>
+-    <div class="message__text">
+-      {text}{#if streaming}<span class="message__cursor" aria-hidden="true"></span>{/if}
+-    </div>
++    {#each segments as segment, index (index)}
++      {#if segment.kind === "text"}
++        <div class="message__text">
++          {@html renderMarkdown(segment.text)}{#if streaming && segment.isLast}<span
++              class="message__cursor"
++              aria-hidden="true"
++            ></span>{/if}
++        </div>
++      {:else}
++        <ToolCallBlock part={segment.part} />
++      {/if}
++    {/each}
++    {#if segments.length === 0 && streaming}
++      <div class="message__text"><span class="message__cursor" aria-hidden="true"></span></div>
++    {/if}
+   </div>
+ </article>
+ 
+@@ -76,7 +119,6 @@
+     font-size: 1.0625rem;
+     line-height: 1.6;
+     color: var(--color-ink);
+-    white-space: pre-wrap;
+     word-break: break-word;
+   }
+ 
+@@ -95,4 +137,90 @@
+       opacity: 0;
+     }
+   }
++
++  /* Rendered-markdown content arrives via {@html}, so Svelte's scoped
++     classes never reach it -- everything below has to be :global(). */
++  .message__text :global(p) {
++    margin: 0 0 var(--space-3);
++  }
++  .message__text :global(p:last-child) {
++    margin-bottom: 0;
++  }
++  .message__text :global(ul),
++  .message__text :global(ol) {
++    margin: 0 0 var(--space-3);
++    padding-left: 1.4em;
++  }
++  .message__text :global(li) {
++    margin: 0 0 var(--space-1);
++  }
++  .message__text :global(blockquote) {
++    margin: 0 0 var(--space-3);
++    padding-left: var(--space-3);
++    border-left: 2px solid var(--color-rule);
++    color: var(--color-ink-soft);
++  }
++  .message__text :global(a) {
++    color: var(--color-accent-user);
++    text-decoration: underline;
++    text-decoration-color: var(--color-rule);
++  }
++  .message__text :global(hr) {
++    border: none;
++    border-top: 1px solid var(--color-rule);
++    margin: var(--space-4) 0;
++  }
++  .message__text :global(code) {
++    font-family: var(--font-mono);
++    font-size: 0.875em;
++    background: var(--color-code-bg);
++    padding: 0.1em 0.35em;
++    border-radius: var(--radius);
++  }
++  .message__text :global(pre) {
++    margin: 0 0 var(--space-3);
++    padding: var(--space-3);
++    background: var(--color-code-bg);
++    border-radius: var(--radius);
++    overflow-x: auto;
++  }
++  .message__text :global(pre code) {
++    background: none;
++    padding: 0;
++    color: var(--color-ink);
++    font-size: 0.875rem;
++    line-height: 1.5;
++  }
++  .message__text :global(.hljs-keyword),
++  .message__text :global(.hljs-literal) {
++    color: var(--color-code-keyword);
++  }
++  .message__text :global(.hljs-string) {
++    color: var(--color-code-string);
++  }
++  .message__text :global(.hljs-comment) {
++    color: var(--color-code-comment);
++    font-style: italic;
++  }
++  .message__text :global(.hljs-number) {
++    color: var(--color-code-number);
++  }
++  .message__text :global(.hljs-title),
++  .message__text :global(.hljs-title.function_) {
++    font-weight: 600;
++  }
++  .message__text :global(.hljs-attr),
++  .message__text :global(.hljs-attribute) {
++    color: var(--color-ink-soft);
++  }
++  /* KaTeX ships its own layout-critical CSS (imported globally in main.ts);
++     this is only a type-family/size nudge so equations sit visually at
++     home in a serif reading column instead of looking pasted in. */
++  .message__text :global(.katex) {
++    font-size: 1.05em;
++  }
++  .message__text :global(.katex-display) {
++    margin: var(--space-3) 0;
++    overflow-x: auto;
++  }
+ </style>
+diff --git a/rwp/src/lib/components/ToolCallBlock.svelte b/rwp/src/lib/components/ToolCallBlock.svelte
+new file mode 100644
+index 0000000..019aa6f
+--- /dev/null
++++ b/rwp/src/lib/components/ToolCallBlock.svelte
+@@ -0,0 +1,136 @@
++<script lang="ts">
++  interface DynamicToolPart {
++    type: "dynamic-tool";
++    toolName: string;
++    toolCallId: string;
++    state: "input-streaming" | "input-available" | "output-available" | "output-error" | string;
++    input?: unknown;
++    output?: unknown;
++    errorText?: string;
++  }
++
++  interface Props {
++    part: DynamicToolPart;
++  }
++
++  let { part }: Props = $props();
++
++  const statusLabel = $derived(
++    part.state === "output-error"
++      ? "Failed"
++      : part.state === "output-available"
++        ? "Done"
++        : "Running",
++  );
++
++  function formatValue(value: unknown): string {
++    if (value === undefined) return "";
++    if (typeof value === "string") return value;
++    try {
++      return JSON.stringify(value, null, 2);
++    } catch {
++      return String(value);
++    }
++  }
++</script>
++
++<details class="tool-call" data-state={part.state}>
++  <summary class="tool-call__summary">
++    <span class="tool-call__name">{part.toolName}</span>
++    <span class="tool-call__status">{statusLabel}</span>
++  </summary>
++  <div class="tool-call__body">
++    {#if part.input !== undefined}
++      <p class="tool-call__label">Input</p>
++      <pre class="tool-call__pre">{formatValue(part.input)}</pre>
++    {/if}
++    {#if part.state === "output-error"}
++      <p class="tool-call__label">Error</p>
++      <pre class="tool-call__pre tool-call__pre--error">{part.errorText}</pre>
++    {:else if part.output !== undefined}
++      <p class="tool-call__label">Output</p>
++      <pre class="tool-call__pre">{formatValue(part.output)}</pre>
++    {/if}
++  </div>
++</details>
++
++<style>
++  .tool-call {
++    margin: var(--space-2) 0;
++    border: 1px solid var(--color-rule);
++    border-radius: var(--radius);
++    background: var(--color-paper-raised);
++  }
++
++  .tool-call__summary {
++    display: flex;
++    align-items: center;
++    gap: var(--space-2);
++    padding: var(--space-2) var(--space-3);
++    cursor: pointer;
++    font-family: var(--font-ui);
++    font-size: 0.8125rem;
++    list-style: none;
++  }
++
++  .tool-call__summary::-webkit-details-marker {
++    display: none;
++  }
++
++  .tool-call__name {
++    font-family: var(--font-mono);
++    font-weight: 600;
++    color: var(--color-accent-assistant);
++  }
++
++  .tool-call__name::before {
++    content: "tool · ";
++    font-family: var(--font-ui);
++    font-weight: 400;
++    color: var(--color-ink-soft);
++  }
++
++  .tool-call__status {
++    margin-left: auto;
++    color: var(--color-ink-soft);
++    text-transform: uppercase;
++    font-size: 0.6875rem;
++    letter-spacing: 0.04em;
++  }
++
++  [data-state="output-error"] .tool-call__status {
++    color: var(--color-error);
++  }
++
++  .tool-call__body {
++    padding: 0 var(--space-3) var(--space-3);
++    border-top: 1px solid var(--color-rule);
++  }
++
++  .tool-call__label {
++    margin: var(--space-2) 0 var(--space-1);
++    font-family: var(--font-ui);
++    font-size: 0.6875rem;
++    text-transform: uppercase;
++    letter-spacing: 0.04em;
++    color: var(--color-ink-soft);
++  }
++
++  .tool-call__pre {
++    margin: 0;
++    padding: var(--space-2);
++    background: var(--color-paper);
++    border-radius: var(--radius);
++    font-family: var(--font-mono);
++    font-size: 0.8125rem;
++    white-space: pre-wrap;
++    word-break: break-word;
++    max-height: 16rem;
++    overflow-y: auto;
++  }
++
++  .tool-call__pre--error {
++    background: var(--color-error-bg);
++    color: var(--color-error);
++  }
++</style>
+diff --git a/rwp/src/lib/components/ToolCallBlock.test.ts b/rwp/src/lib/components/ToolCallBlock.test.ts
+new file mode 100644
+index 0000000..dd4632d
+--- /dev/null
++++ b/rwp/src/lib/components/ToolCallBlock.test.ts
+@@ -0,0 +1,76 @@
++import { describe, it, expect } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import ToolCallBlock from "./ToolCallBlock.svelte";
++
++describe("ToolCallBlock", () => {
++  it("shows the tool name and a Done status with its output", () => {
++    render(ToolCallBlock, {
++      props: {
++        part: {
++          type: "dynamic-tool",
++          toolCallId: "call_1",
++          toolName: "calculator",
++          state: "output-available",
++          input: { expr: "2+2" },
++          output: "4",
++        },
++      },
++    });
++
++    expect(screen.getByText("calculator")).toBeInTheDocument();
++    expect(screen.getByText("Done")).toBeInTheDocument();
++    expect(screen.getByText("4")).toBeInTheDocument();
++  });
++
++  it("shows a Running status while only input is available", () => {
++    render(ToolCallBlock, {
++      props: {
++        part: {
++          type: "dynamic-tool",
++          toolCallId: "call_1",
++          toolName: "web_search",
++          state: "input-available",
++          input: { query: "paeka" },
++        },
++      },
++    });
++
++    expect(screen.getByText("Running")).toBeInTheDocument();
++  });
++
++  it("shows a Failed status and the error text, not an output block", () => {
++    render(ToolCallBlock, {
++      props: {
++        part: {
++          type: "dynamic-tool",
++          toolCallId: "call_1",
++          toolName: "web_search",
++          state: "output-error",
++          input: { query: "paeka" },
++          errorText: "[MCP ERROR] timeout",
++        },
++      },
++    });
++
++    expect(screen.getByText("Failed")).toBeInTheDocument();
++    expect(screen.getByText("[MCP ERROR] timeout")).toBeInTheDocument();
++    expect(screen.queryByText("Output")).not.toBeInTheDocument();
++  });
++
++  it("pretty-prints object input as JSON", () => {
++    render(ToolCallBlock, {
++      props: {
++        part: {
++          type: "dynamic-tool",
++          toolCallId: "call_1",
++          toolName: "calculator",
++          state: "output-available",
++          input: { expr: "2+2", precision: 2 },
++          output: "4",
++        },
++      },
++    });
++
++    expect(screen.getByText(/"expr": "2\+2"/)).toBeInTheDocument();
++  });
++});
+diff --git a/rwp/src/lib/components/TopNav.svelte b/rwp/src/lib/components/TopNav.svelte
+new file mode 100644
+index 0000000..76e5292
+--- /dev/null
++++ b/rwp/src/lib/components/TopNav.svelte
+@@ -0,0 +1,141 @@
++<script lang="ts">
++  import { onMount } from "svelte";
++  import { initTheme, toggleTheme, type Theme } from "../theme";
++
++  interface NavTab {
++    id: string;
++    label: string;
++    enabled: boolean;
++  }
++
++  // Only "Chat" does anything today. Archive (Paper Library/Lab Book) and
++  // Settings are shown -- matching the LiLi reference's tab row and the
++  // SRS's workspace navigation -- but kept disabled rather than wired to
++  // nothing, so the affordance is honest about what currently exists.
++  const tabs: NavTab[] = [
++    { id: "chat", label: "Chat", enabled: true },
++    { id: "archive", label: "Archive", enabled: false },
++    { id: "settings", label: "Settings", enabled: false },
++  ];
++
++  let activeTab = $state("chat");
++  let theme: Theme = $state("light");
++
++  onMount(() => {
++    theme = initTheme();
++  });
++
++  function selectTab(tab: NavTab) {
++    if (!tab.enabled) return;
++    activeTab = tab.id;
++  }
++
++  function handleToggleTheme() {
++    theme = toggleTheme(theme);
++  }
++</script>
++
++<nav class="top-nav" aria-label="Workspace sections">
++  <div class="top-nav__tabs" role="tablist">
++    {#each tabs as tab (tab.id)}
++      <button
++        type="button"
++        class="top-nav__tab"
++        class:top-nav__tab--active={activeTab === tab.id}
++        role="tab"
++        aria-selected={activeTab === tab.id}
++        aria-disabled={!tab.enabled}
++        disabled={!tab.enabled}
++        title={tab.enabled ? undefined : "Coming soon"}
++        onclick={() => selectTab(tab)}
++      >
++        {tab.label}
++      </button>
++    {/each}
++  </div>
++
++  <button
++    type="button"
++    class="top-nav__theme-toggle"
++    onclick={handleToggleTheme}
++    aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
++    title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
++  >
++    {#if theme === "dark"}
++      <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
++        <circle cx="10" cy="10" r="4.5" fill="currentColor" />
++        <g stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
++          <line x1="10" y1="1.5" x2="10" y2="3.5" />
++          <line x1="10" y1="16.5" x2="10" y2="18.5" />
++          <line x1="1.5" y1="10" x2="3.5" y2="10" />
++          <line x1="16.5" y1="10" x2="18.5" y2="10" />
++          <line x1="4.2" y1="4.2" x2="5.6" y2="5.6" />
++          <line x1="14.4" y1="14.4" x2="15.8" y2="15.8" />
++          <line x1="4.2" y1="15.8" x2="5.6" y2="14.4" />
++          <line x1="14.4" y1="5.6" x2="15.8" y2="4.2" />
++        </g>
++      </svg>
++    {:else}
++      <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
++        <path fill="currentColor" d="M14.5 11.4A6 6 0 0 1 8.6 5.5a6 6 0 1 0 5.9 5.9Z" />
++      </svg>
++    {/if}
++  </button>
++</nav>
++
++<style>
++  .top-nav {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    gap: var(--space-4);
++  }
++
++  .top-nav__tabs {
++    display: flex;
++    gap: var(--space-4);
++  }
++
++  .top-nav__tab {
++    font-family: var(--font-ui);
++    font-size: 0.8125rem;
++    font-weight: 600;
++    letter-spacing: 0.03em;
++    text-transform: uppercase;
++    color: var(--color-ink-soft);
++    background: none;
++    border: none;
++    padding: var(--space-1) 0 var(--space-2);
++    border-bottom: 2px solid transparent;
++    cursor: pointer;
++  }
++
++  .top-nav__tab:disabled {
++    cursor: default;
++    opacity: 0.45;
++  }
++
++  .top-nav__tab--active {
++    color: var(--color-ink);
++    border-bottom-color: var(--color-accent-user);
++  }
++
++  .top-nav__theme-toggle {
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    width: 1.75rem;
++    height: 1.75rem;
++    flex: 0 0 auto;
++    color: var(--color-ink-soft);
++    background: none;
++    border: 1px solid var(--color-rule);
++    border-radius: var(--radius);
++    cursor: pointer;
++  }
++
++  .top-nav__theme-toggle:hover {
++    color: var(--color-ink);
++    border-color: var(--color-ink-soft);
++  }
++</style>
+diff --git a/rwp/src/lib/components/TopNav.test.ts b/rwp/src/lib/components/TopNav.test.ts
+new file mode 100644
+index 0000000..2f12874
+--- /dev/null
++++ b/rwp/src/lib/components/TopNav.test.ts
+@@ -0,0 +1,34 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import { render, screen } from "@testing-library/svelte";
++import userEvent from "@testing-library/user-event";
++import TopNav from "./TopNav.svelte";
++
++beforeEach(() => {
++  localStorage.clear();
++  document.documentElement.removeAttribute("data-theme");
++});
++
++describe("TopNav", () => {
++  it("renders Chat as the active tab and Archive/Settings as disabled placeholders", () => {
++    render(TopNav);
++    expect(screen.getByRole("tab", { name: "Chat" })).toHaveAttribute("aria-selected", "true");
++    expect(screen.getByRole("tab", { name: "Archive" })).toBeDisabled();
++    expect(screen.getByRole("tab", { name: "Settings" })).toBeDisabled();
++  });
++
++  it("ignores clicks on a disabled tab", async () => {
++    const user = userEvent.setup();
++    render(TopNav);
++    await user.click(screen.getByRole("tab", { name: "Archive" }));
++    expect(screen.getByRole("tab", { name: "Chat" })).toHaveAttribute("aria-selected", "true");
++  });
++
++  it("toggles and persists the theme", async () => {
++    const user = userEvent.setup();
++    render(TopNav);
++    await user.click(screen.getByRole("button", { name: /switch to dark theme/i }));
++    expect(document.documentElement.dataset.theme).toBe("dark");
++    expect(localStorage.getItem("rwp:theme")).toBe("dark");
++    expect(screen.getByRole("button", { name: /switch to light theme/i })).toBeInTheDocument();
++  });
++});
+diff --git a/rwp/src/lib/markdown.test.ts b/rwp/src/lib/markdown.test.ts
+new file mode 100644
+index 0000000..002149e
+--- /dev/null
++++ b/rwp/src/lib/markdown.test.ts
+@@ -0,0 +1,65 @@
++import { describe, it, expect } from "vitest";
++import { renderMarkdown } from "./markdown";
++
++describe("renderMarkdown", () => {
++  it("returns an empty string for empty input", () => {
++    expect(renderMarkdown("")).toBe("");
++  });
++
++  it("renders basic markdown formatting", () => {
++    const html = renderMarkdown("**bold** and *italic*");
++    expect(html).toContain("<strong>bold</strong>");
++    expect(html).toContain("<em>italic</em>");
++  });
++
++  it("renders lists", () => {
++    const html = renderMarkdown("- one\n- two");
++    expect(html).toContain("<li>one</li>");
++    expect(html).toContain("<li>two</li>");
++  });
++
++  it("syntax-highlights fenced code blocks", () => {
++    const html = renderMarkdown("```python\ndef f():\n    return 1\n```");
++    expect(html).toContain("hljs-keyword");
++    expect(html).toContain("def");
++  });
++
++  it("never leaks a raw unescaped tag for unrecognized languages", () => {
++    // highlightAuto() guesses something (often markup/XML, given the angle
++    // brackets) rather than throwing -- the real invariant is "no live
++    // <stuff> tag survives", not which internal hljs path produced it.
++    const html = renderMarkdown("```not-a-real-lang\nraw <stuff>\n```");
++    expect(html).not.toContain("<stuff>");
++  });
++
++  it("renders inline LaTeX via KaTeX", () => {
++    const html = renderMarkdown("Energy is $E = mc^2$.");
++    expect(html).toContain("katex");
++  });
++
++  it("renders block LaTeX via KaTeX", () => {
++    const html = renderMarkdown("$$\\frac{a}{b} = c$$");
++    expect(html).toContain("katex-display");
++  });
++
++  it("does not throw on malformed LaTeX, and degrades to visible error text", () => {
++    expect(() => renderMarkdown("$\\frac{$")).not.toThrow();
++  });
++
++  it("escapes/strips script and img tags so no live executable element exists (prompt-injection surface)", () => {
++    const html = renderMarkdown('<script>alert(1)</script><img src=x onerror="alert(1)">');
++    const doc = new DOMParser().parseFromString(html, "text/html");
++    expect(doc.querySelectorAll("script, img").length).toBe(0);
++  });
++
++  it("preserves plain paragraphs and links", () => {
++    const html = renderMarkdown("See https://example.com for details.");
++    expect(html).toContain('href="https://example.com"');
++  });
++
++  it("opens links in a new tab with noopener (no in-app back affordance)", () => {
++    const html = renderMarkdown("[paper](https://example.com/paper.pdf)");
++    expect(html).toContain('target="_blank"');
++    expect(html).toContain('rel="noopener noreferrer"');
++  });
++});
+diff --git a/rwp/src/lib/markdown.ts b/rwp/src/lib/markdown.ts
+new file mode 100644
+index 0000000..5e9981c
+--- /dev/null
++++ b/rwp/src/lib/markdown.ts
+@@ -0,0 +1,104 @@
++import MarkdownIt from "markdown-it";
++import * as markdownItKatexModule from "@vscode/markdown-it-katex";
++import hljs from "highlight.js";
++import DOMPurify from "dompurify";
++
++// [SEAM] @vscode/markdown-it-katex ships as `exports.default = fn` (a
++// transpiled-CJS shape). Different tools resolve that to different,
++// confirmed-empirically-different depths of wrapping (Vitest: the bare
++// function; plain Node ESM: one level of .default; Vite's production
++// rolldown bundle: two levels of .default -- traced directly in the
++// built output). A first attempt resolved this with a `while` loop at
++// module scope, but the bundler's minifier collapsed that loop down to
++// a single `typeof x === "function" ? x : x.default` check, silently
++// handling only one of the two levels this package actually needs.
++//
++// The fix: wrap the plugin in a real function instead of resolving it
++// to a value at module scope. markdown-it's `.use()` calls
++// `plugin.apply(...)`, so as long as what we hand it is *syntactically*
++// a function -- which markdownItKatexPlugin always is -- that call can
++// never fail regardless of what minification did to anything inside
++// it. The actual .default-walking happens lazily, at call time, against
++// a closed-over variable -- ordinary property access a minifier has no
++// reason to "optimize" away, unlike a chain of module-scope consts.
++function markdownItKatexPlugin(md: MarkdownIt, options?: Record<string, unknown>): void {
++  let plugin: unknown = markdownItKatexModule;
++  for (let depth = 0; depth < 5 && typeof plugin !== "function"; depth++) {
++    if (plugin && typeof plugin === "object" && "default" in plugin) {
++      plugin = (plugin as { default: unknown }).default;
++    } else {
++      break;
++    }
++  }
++  if (typeof plugin !== "function") {
++    throw new Error(
++      "markdown.ts: could not resolve @vscode/markdown-it-katex's plugin function from its module export.",
++    );
++  }
++  (plugin as (md: MarkdownIt, options?: Record<string, unknown>) => void)(md, options);
++}
++
++// [SEAM] Single shared parser instance -- markdown-it instances are cheap
++// to reuse across renders and expensive-ish to construct (loads its full
++// rule set each time), so this module creates exactly one.
++const md: MarkdownIt = new MarkdownIt({
++  html: false, // raw HTML in model output is never executed as markup -- see sanitizeHtml() below, which is the actual security boundary, but no sense even parsing it as HTML here.
++  linkify: true,
++  breaks: true,
++  highlight(code: string, lang: string): string {
++    const language = lang && hljs.getLanguage(lang) ? lang : undefined;
++    try {
++      const result = language
++        ? hljs.highlight(code, { language })
++        : hljs.highlightAuto(code);
++      return result.value;
++    } catch {
++      return md.utils.escapeHtml(code);
++    }
++  },
++});
++
++md.use(markdownItKatexPlugin, {
++  throwOnError: false,
++  // Bare \begin{...}\end{...} blocks are common in LLM output that's
++  // half-remembering LaTeX conventions -- worth rendering even without
++  // the $$ delimiters a strict reading of the spec would require.
++  enableBareBlocks: true,
++});
++
++// Links (including auto-linked URLs from linkify) open in a real new tab
++// rather than navigating the chat window away -- there's no "back"
++// affordance in this app shell, and that matters more once it's running
++// inside a Tauri webview instead of a regular browser tab.
++const defaultLinkOpen =
++  md.renderer.rules.link_open ??
++  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
++md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
++  tokens[idx].attrSet("target", "_blank");
++  tokens[idx].attrSet("rel", "noopener noreferrer");
++  return defaultLinkOpen(tokens, idx, options, env, self);
++};
++
++/**
++ * Renders LLM-authored markdown (including LaTeX via KaTeX and fenced code
++ * via highlight.js) to sanitized HTML safe to inject with `{@html}`.
++ *
++ * The sanitize step is not optional: this text originates from a model
++ * whose own output can be steered by retrieved documents, tool results, or
++ * web search content (prompt injection), so it is untrusted by construction
++ * regardless of how much we trust the model weights themselves.
++ */
++export function renderMarkdown(source: string): string {
++  const rawHtml = md.render(source);
++  return sanitizeHtml(rawHtml);
++}
++
++function sanitizeHtml(rawHtml: string): string {
++  return DOMPurify.sanitize(rawHtml, {
++    // KaTeX's output mixes plain HTML with inline MathML and (for things
++    // like \sqrt radicals and \overline) SVG paths -- all three profiles
++    // are needed or KaTeX's own markup gets silently stripped.
++    USE_PROFILES: { html: true, svg: true, svgFilters: true, mathMl: true },
++    ADD_ATTR: ["target", "rel"], // linkify-generated/forced rel+target on anchors; harmless to keep, needed for noopener.
++  });
++}
+diff --git a/rwp/src/lib/theme.test.ts b/rwp/src/lib/theme.test.ts
+new file mode 100644
+index 0000000..d665f84
+--- /dev/null
++++ b/rwp/src/lib/theme.test.ts
+@@ -0,0 +1,42 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import { getTheme, applyTheme, initTheme, toggleTheme } from "./theme";
++
++beforeEach(() => {
++  localStorage.clear();
++  document.documentElement.removeAttribute("data-theme");
++});
++
++describe("theme", () => {
++  it("defaults to light with nothing stored and no system preference available", () => {
++    expect(getTheme()).toBe("light");
++  });
++
++  it("respects a previously stored preference", () => {
++    applyTheme("dark");
++    expect(getTheme()).toBe("dark");
++  });
++
++  it("ignores a corrupted stored value rather than throwing", () => {
++    localStorage.setItem("rwp:theme", "purple");
++    expect(getTheme()).toBe("light");
++  });
++
++  it("initTheme applies the resolved theme to the document element", () => {
++    localStorage.setItem("rwp:theme", "dark");
++    const theme = initTheme();
++    expect(theme).toBe("dark");
++    expect(document.documentElement.dataset.theme).toBe("dark");
++  });
++
++  it("initTheme does not write a system-derived default to storage", () => {
++    initTheme();
++    expect(localStorage.getItem("rwp:theme")).toBeNull();
++  });
++
++  it("toggleTheme flips the theme and persists the explicit choice", () => {
++    const next = toggleTheme("light");
++    expect(next).toBe("dark");
++    expect(localStorage.getItem("rwp:theme")).toBe("dark");
++    expect(document.documentElement.dataset.theme).toBe("dark");
++  });
++});
+diff --git a/rwp/src/lib/theme.ts b/rwp/src/lib/theme.ts
+new file mode 100644
+index 0000000..c148583
+--- /dev/null
++++ b/rwp/src/lib/theme.ts
+@@ -0,0 +1,62 @@
++const STORAGE_KEY = "rwp:theme";
++
++export type Theme = "light" | "dark";
++
++function isTheme(value: string | null): value is Theme {
++  return value === "light" || value === "dark";
++}
++
++function systemPreference(): Theme {
++  const matches =
++    typeof window !== "undefined" &&
++    typeof window.matchMedia === "function" &&
++    window.matchMedia("(prefers-color-scheme: dark)").matches;
++  return matches ? "dark" : "light";
++}
++
++function readStored(): Theme | null {
++  try {
++    const raw = localStorage.getItem(STORAGE_KEY);
++    return isTheme(raw) ? raw : null;
++  } catch {
++    // localStorage unavailable (private mode, disabled storage, etc.) --
++    // fall back to the system default rather than throwing.
++    return null;
++  }
++}
++
++/** Resolves the theme that should be active: stored choice, else system default. */
++export function getTheme(): Theme {
++  return readStored() ?? systemPreference();
++}
++
++/** Applies a theme to the document and persists it as the user's explicit choice. */
++export function applyTheme(theme: Theme): void {
++  document.documentElement.dataset.theme = theme;
++  try {
++    localStorage.setItem(STORAGE_KEY, theme);
++  } catch {
++    // Non-fatal: the theme still applies for this session, it just won't
++    // be remembered next launch.
++  }
++}
++
++/**
++ * Call once on startup: resolves and applies the initial theme, returns it.
++ *
++ * Deliberately does NOT call applyTheme()/persist to localStorage here --
++ * if the user never explicitly toggled, we want next launch to still
++ * follow a changed system preference rather than being locked to
++ * whatever we happened to resolve once and silently wrote down.
++ */
++export function initTheme(): Theme {
++  const theme = getTheme();
++  document.documentElement.dataset.theme = theme;
++  return theme;
++}
++
++export function toggleTheme(current: Theme): Theme {
++  const next: Theme = current === "dark" ? "light" : "dark";
++  applyTheme(next);
++  return next;
++}
+diff --git a/rwp/src/main.ts b/rwp/src/main.ts
+index e7e29a0..e6b9bf0 100644
+--- a/rwp/src/main.ts
++++ b/rwp/src/main.ts
+@@ -1,3 +1,4 @@
++import "katex/dist/katex.min.css";
+ import { mount } from "svelte";
+ import App from "./App.svelte";
+ 
+diff --git a/tests/unit/test_agent_routes.py b/tests/unit/test_agent_routes.py
+new file mode 100644
+index 0000000..9804338
+--- /dev/null
++++ b/tests/unit/test_agent_routes.py
+@@ -0,0 +1,160 @@
++"""
++tests/unit/test_agent_routes.py
++=================================
++Unit tests for ReactRequest.resolve_turn() in backend/api/routes/agent.py,
++plus a route-level test exercising the actual react() handler end to end
++(LLM and MCP calls mocked, no real FastAPI app/DB needed since the
++handler only ever touches request.app.state).
++"""
++
++from __future__ import annotations
++
++from unittest.mock import AsyncMock
++
++import pytest
++from langchain_core.messages import AIMessage
++
++
++def test_resolve_turn_with_messages_returns_last_as_new_turn_and_rest_as_history():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest(
++        messages=[
++            {"role": "user", "content": "first"},
++            {"role": "assistant", "content": "reply"},
++            {"role": "user", "content": "second"},
++        ]
++    )
++
++    user_message, history = req.resolve_turn()
++
++    assert user_message == "second"
++    assert history == [
++        {"role": "user", "content": "first"},
++        {"role": "assistant", "content": "reply"},
++    ]
++
++
++def test_resolve_turn_with_messages_single_entry_has_empty_history():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest(messages=[{"role": "user", "content": "only this"}])
++    user_message, history = req.resolve_turn()
++
++    assert user_message == "only this"
++    assert history == []
++
++
++def test_resolve_turn_falls_back_to_legacy_message_field():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest(message="legacy single-turn call")
++    user_message, history = req.resolve_turn()
++
++    assert user_message == "legacy single-turn call"
++    assert history == []
++
++
++def test_resolve_turn_prefers_messages_when_both_are_present():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest(message="ignored", messages=[{"role": "user", "content": "used instead"}])
++    user_message, _ = req.resolve_turn()
++
++    assert user_message == "used instead"
++
++
++def test_resolve_turn_raises_when_neither_field_is_set():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest()
++    with pytest.raises(ValueError, match="message"):
++        req.resolve_turn()
++
++
++def test_resolve_turn_raises_on_empty_messages_list():
++    from backend.api.routes.agent import ReactRequest
++
++    req = ReactRequest(messages=[])
++    with pytest.raises(ValueError):
++        req.resolve_turn()
++
++
++# ---------------------------------------------------------------------------
++# Route-level: calls the actual react() handler, not just resolve_turn().
++# request.app.state is the only thing the handler touches, so a minimal
++# stub stands in for a real FastAPI app/lifespan (no DB, no real Ollama).
++# ---------------------------------------------------------------------------
++
++
++class _FakeProviderLLM:
++    provider_name = "fake"
++
++    async def health_check(self) -> bool:
++        return True
++
++
++class _FakeChatOllama:
++    """Always returns a final answer with no tool calls -- this test is
++    about the route's plumbing (request -> ReActGraph -> ReactResponse),
++    not the agent loop itself, which test_react_graph.py already covers."""
++
++    def bind_tools(self, tools):
++        return self
++
++    async def ainvoke(self, messages):
++        return AIMessage(content="The answer is 4.")
++
++
++class _StateStub:
++    def __init__(self, llm=None, chat_ollama=None):
++        self.llm = llm
++        self.chat_ollama = chat_ollama
++
++
++class _RequestStub:
++    def __init__(self, llm=None, chat_ollama=None):
++        self.app = type("AppStub", (), {"state": _StateStub(llm=llm, chat_ollama=chat_ollama)})()
++
++
++async def test_react_route_returns_response_and_empty_tool_calls(monkeypatch):
++    from backend.api.routes.agent import react, ReactRequest, ReactResponse
++
++    monkeypatch.setattr(
++        "backend.agent.react_graph.get_tool_schemas", AsyncMock(return_value=[])
++    )
++
++    request = _RequestStub(llm=_FakeProviderLLM(), chat_ollama=_FakeChatOllama())
++    body = ReactRequest(messages=[{"role": "user", "content": "what is 2+2?"}])
++
++    response = await react(body, request)
++
++    assert isinstance(response, ReactResponse)
++    assert response.response == "The answer is 4."
++    assert response.tool_calls == []
++
++
++async def test_react_route_returns_503_when_chat_ollama_not_initialised():
++    from backend.api.routes.agent import react, ReactRequest
++    from fastapi import HTTPException
++
++    request = _RequestStub(llm=_FakeProviderLLM(), chat_ollama=None)
++    body = ReactRequest(messages=[{"role": "user", "content": "hi"}])
++
++    with pytest.raises(HTTPException) as exc_info:
++        await react(body, request)
++
++    assert exc_info.value.status_code == 503
++
++
++async def test_react_route_returns_422_when_neither_message_field_is_set():
++    from backend.api.routes.agent import react, ReactRequest
++    from fastapi import HTTPException
++
++    request = _RequestStub(llm=_FakeProviderLLM(), chat_ollama=_FakeChatOllama())
++    body = ReactRequest()
++
++    with pytest.raises(HTTPException) as exc_info:
++        await react(body, request)
++
++    assert exc_info.value.status_code == 422
+diff --git a/tests/unit/test_react_graph.py b/tests/unit/test_react_graph.py
+new file mode 100644
+index 0000000..e74d6a2
+--- /dev/null
++++ b/tests/unit/test_react_graph.py
+@@ -0,0 +1,177 @@
++"""
++tests/unit/test_react_graph.py
++================================
++Unit tests for ReActGraph.run(): history threading into initial_messages,
++and the tool-call trace it now returns alongside the final text instead
++of discarding. All LLM calls and MCP tool calls are mocked.
++"""
++
++from __future__ import annotations
++
++from unittest.mock import AsyncMock
++
++import pytest
++from langchain_core.messages import AIMessage
++
++
++class _FakeLLM:
++    """Returns the next AIMessage from a fixed queue on each ainvoke(),
++    mirroring ChatOllama.bind_tools(...).ainvoke(messages) closely enough
++    for _agent_node's purposes (it only ever uses these two calls)."""
++
++    def __init__(self, responses: list[AIMessage]):
++        self._responses = list(responses)
++        self.bind_tools_calls: list[list[dict]] = []
++        self.ainvoke_calls: list[list] = []
++
++    def bind_tools(self, tools):
++        self.bind_tools_calls.append(tools)
++        return self
++
++    async def ainvoke(self, messages):
++        self.ainvoke_calls.append(messages)
++        return self._responses.pop(0)
++
++
++def _tool_call_message(name: str, args: dict, call_id: str) -> AIMessage:
++    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}])
++
++
++@pytest.fixture(autouse=True)
++def _no_real_tool_schemas(monkeypatch):
++    # Every test sets its own get_tool_schemas() behaviour explicitly via
++    # monkeypatch where it matters; this fixture just guarantees no test
++    # accidentally reaches the network if it forgets to.
++    monkeypatch.setattr(
++        "backend.agent.react_graph.get_tool_schemas", AsyncMock(return_value=[])
++    )
++
++
++async def test_run_returns_response_with_no_tool_calls():
++    from backend.agent.react_graph import ReActGraph
++
++    llm = _FakeLLM([AIMessage(content="Hello there!")])
++    graph = ReActGraph(llm=llm, max_rounds=3)
++
++    result = await graph.run(user_message="hi")
++
++    assert result["response"] == "Hello there!"
++    assert result["tool_calls"] == []
++
++
++async def test_run_executes_a_tool_and_returns_its_trace(monkeypatch):
++    from backend.agent.react_graph import ReActGraph
++
++    monkeypatch.setattr(
++        "backend.agent.react_graph.get_tool_schemas",
++        AsyncMock(return_value=[{"name": "calculator", "description": "adds numbers"}]),
++    )
++    monkeypatch.setattr(
++        "backend.agent.react_graph.call_tool", AsyncMock(return_value="4")
++    )
++
++    llm = _FakeLLM(
++        [
++            _tool_call_message("calculator", {"expr": "2+2"}, "call_1"),
++            AIMessage(content="The answer is 4."),
++        ]
++    )
++    graph = ReActGraph(llm=llm, max_rounds=3)
++
++    result = await graph.run(user_message="what is 2+2?")
++
++    assert result["response"] == "The answer is 4."
++    assert result["tool_calls"] == [
++        {"id": "call_1", "name": "calculator", "args": {"expr": "2+2"}, "result": "4", "ok": True}
++    ]
++    # bind_tools() should have been handed exactly the schemas get_tool_schemas() returned
++    assert llm.bind_tools_calls[0] == [{"name": "calculator", "description": "adds numbers"}]
++
++
++async def test_run_marks_a_failed_tool_call_as_not_ok(monkeypatch):
++    from backend.agent.react_graph import ReActGraph
++
++    monkeypatch.setattr(
++        "backend.agent.react_graph.get_tool_schemas",
++        AsyncMock(return_value=[{"name": "web_search", "description": "search the web"}]),
++    )
++    monkeypatch.setattr(
++        "backend.agent.react_graph.call_tool",
++        AsyncMock(return_value="[MCP ERROR] timeout contacting search backend"),
++    )
++
++    llm = _FakeLLM(
++        [
++            _tool_call_message("web_search", {"query": "paeka"}, "call_2"),
++            AIMessage(content="I couldn't find anything."),
++        ]
++    )
++    graph = ReActGraph(llm=llm, max_rounds=3)
++
++    result = await graph.run(user_message="look this up")
++
++    assert result["tool_calls"][0]["ok"] is False
++    assert result["tool_calls"][0]["result"].startswith("[MCP ERROR]")
++
++
++async def test_run_threads_prior_history_into_initial_messages():
++    from backend.agent.react_graph import ReActGraph
++
++    llm = _FakeLLM([AIMessage(content="ok")])
++    graph = ReActGraph(llm=llm, max_rounds=3)
++
++    await graph.run(
++        user_message="and then?",
++        history=[
++            {"role": "user", "content": "first turn"},
++            {"role": "assistant", "content": "first reply"},
++        ],
++    )
++
++    contents = [m.content for m in llm.ainvoke_calls[0]]
++    # First message is always the system prompt -- everything after it
++    # should be history in order, then the new turn last.
++    assert contents[1:] == ["first turn", "first reply", "and then?"]
++
++
++async def test_run_with_no_history_only_has_system_and_new_message():
++    from backend.agent.react_graph import ReActGraph
++
++    llm = _FakeLLM([AIMessage(content="ok")])
++    graph = ReActGraph(llm=llm, max_rounds=3)
++
++    await graph.run(user_message="hi")
++
++    contents = [m.content for m in llm.ainvoke_calls[0]]
++    assert contents[1:] == ["hi"]
++
++
++def test_extract_tool_call_trace_pairs_calls_with_results_by_id():
++    from backend.agent.react_graph import _extract_tool_call_trace
++    from langchain_core.messages import ToolMessage
++
++    messages = [
++        _tool_call_message("a", {"x": 1}, "id1"),
++        ToolMessage(content="result-a", tool_call_id="id1", name="a"),
++        _tool_call_message("b", {"y": 2}, "id2"),
++        ToolMessage(content="[BLOCKED] repeated call", tool_call_id="id2", name="b"),
++    ]
++
++    trace = _extract_tool_call_trace(messages)
++
++    assert trace == [
++        {"id": "id1", "name": "a", "args": {"x": 1}, "result": "result-a", "ok": True},
++        {"id": "id2", "name": "b", "args": {"y": 2}, "result": "[BLOCKED] repeated call", "ok": False},
++    ]
++
++
++def test_extract_tool_call_trace_handles_a_call_with_no_matching_result():
++    # Shouldn't happen in practice (every tool_call gets a ToolMessage),
++    # but a partially-failed graph run is exactly the case where being
++    # defensive here actually matters.
++    from backend.agent.react_graph import _extract_tool_call_trace
++
++    messages = [_tool_call_message("a", {}, "id1")]
++    trace = _extract_tool_call_trace(messages)
++
++    assert trace == [{"id": "id1", "name": "a", "args": {}, "result": "", "ok": True}]

@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoke-test": "node scripts/smoke-test-bundle.mjs",
+    "verify": "bun run test && bun run check && bun run build && bun run smoke-test"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
@@ -18,6 +20,8 @@
     "@testing-library/svelte": "^5.4.2",
     "@testing-library/user-event": "^14.5.2",
     "@tsconfig/svelte": "^5.0.4",
+    "@types/dompurify": "^3.2.0",
+    "@types/markdown-it": "^14.1.2",
     "jsdom": "^29.1.1",
     "svelte": "^5.56.4",
     "svelte-check": "^4.1.1",
@@ -29,6 +33,11 @@
     "@ai-sdk/openai-compatible": "^3.0.0",
     "@ai-sdk/provider-utils": "^5.0.0",
     "@ai-sdk/svelte": "^5.0.3",
-    "ai": "^7.0.3"
+    "@vscode/markdown-it-katex": "^1.1.2",
+    "ai": "^7.0.3",
+    "dompurify": "^3.4.11",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.17.0",
+    "markdown-it": "^14.2.0"
   }
 }

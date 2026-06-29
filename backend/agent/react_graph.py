@@ -125,6 +125,10 @@ def _span(name: str, **attrs: Any):
 # ReActGraph
 # ---------------------------------------------------------------------------
 
+def _is_tool_error(content: str) -> bool:
+    return content.startswith("[MCP ERROR]") or content.startswith("[BLOCKED]")
+
+
 class ReActGraph:
     """Minimal two-node ReAct graph: agent_node <-> tool_node."""
 
@@ -144,8 +148,20 @@ class ReActGraph:
     async def run(
         self,
         user_message: str,
+        history: list[dict[str, str]] | None = None,
         conversation_memory=None,
-    ) -> str:
+    ) -> dict[str, Any]:
+        """
+        Returns {"response": str, "tool_calls": [...]}.
+
+        `history` is the prior turns of this conversation as plain
+        {"role", "content"} dicts (oldest first, NOT including
+        user_message itself) -- mirrors the shape /v1/chat/completions
+        already takes, since every call here is otherwise stateless
+        (each request gets its own fresh ReActGraph.run(), there is no
+        server-side session). Without it, every turn would start from
+        nothing and the chat UI's history would be theatre.
+        """
         tool_schemas = await get_tool_schemas(mcp_url=self._mcp_url)
 
         system_content = self._system_prompt
@@ -161,10 +177,14 @@ class ReActGraph:
             except Exception as exc:
                 logger.warning("ConversationMemory.get_context() failed: %s", exc)
 
-        initial_messages: list[BaseMessage] = [
-            SystemMessage(content=system_content),
-            HumanMessage(content=user_message),
-        ]
+        initial_messages: list[BaseMessage] = [SystemMessage(content=system_content)]
+        for turn in history or []:
+            content = turn.get("content", "")
+            if turn.get("role") == "assistant":
+                initial_messages.append(AIMessage(content=content))
+            else:
+                initial_messages.append(HumanMessage(content=content))
+        initial_messages.append(HumanMessage(content=user_message))
 
         # One guard instance per run, threaded through config so it persists
         # across agent<->tool rounds within this single conversation turn.
@@ -183,11 +203,15 @@ class ReActGraph:
         with _span("react_graph.run", user_message_chars=len(user_message)):
             result = await self._graph.ainvoke({"messages": initial_messages}, config=config)
 
+        result_messages = result.get("messages", [])
+
         final = ""
-        for msg in reversed(result.get("messages", [])):
+        for msg in reversed(result_messages):
             if isinstance(msg, AIMessage) and msg.content:
                 final = msg.content
                 break
+
+        tool_calls = _extract_tool_call_trace(result_messages)
 
         if conversation_memory is not None and final:
             try:
@@ -196,7 +220,7 @@ class ReActGraph:
             except Exception as exc:
                 logger.warning("ConversationMemory.add_turn() failed: %s", exc)
 
-        return final
+        return {"response": final, "tool_calls": tool_calls}
 
     def _build(self) -> Any:
         g = StateGraph(MessagesState)
@@ -288,7 +312,7 @@ async def _tool_node(state: MessagesState, config: RunnableConfig | None = None)
         with _span("react_graph.tool_call", tool_name=name):
             result = await call_tool(name, args, mcp_url=mcp_url)
 
-        success = not result.startswith("[MCP ERROR]")
+        success = not _is_tool_error(result)
         if guard is not None:
             guard.record_result(name, args, success=success, result=result)
 
@@ -300,8 +324,7 @@ async def _tool_node(state: MessagesState, config: RunnableConfig | None = None)
         )
 
     for tm in tool_messages:
-        status = "OK" if not (tm.content.startswith("[MCP ERROR]")
-                              or tm.content.startswith("[BLOCKED]")) else "FAILED/BLOCKED"
+        status = "OK" if not _is_tool_error(tm.content) else "FAILED/BLOCKED"
         logger.info("Tool %s: %s (%d chars)", tm.name, status, len(tm.content))
 
     return {"messages": tool_messages}
@@ -345,6 +368,39 @@ def _trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
         content=f"[{len(trimmed)} earlier messages trimmed to stay within context window]"
     )
     return [system, summary, *recent]
+
+
+def _extract_tool_call_trace(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    """
+    Walks the full message trace from one graph run and pairs each
+    AIMessage tool_call with its matching ToolMessage result by
+    tool_call_id, in call order. This is exactly the data the graph
+    already produces each round internally -- the only thing that was
+    missing before was returning it instead of discarding everything but
+    the final AIMessage's text.
+    """
+    results_by_id: dict[str, ToolMessage] = {
+        m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)
+    }
+
+    trace: list[dict[str, Any]] = []
+    for msg in messages:
+        if not (isinstance(msg, AIMessage) and msg.tool_calls):
+            continue
+        for tc in msg.tool_calls:
+            call_id = tc.get("id", "")
+            result_msg = results_by_id.get(call_id)
+            result_text = result_msg.content if result_msg is not None else ""
+            trace.append(
+                {
+                    "id": call_id,
+                    "name": tc.get("name", ""),
+                    "args": tc.get("args") or {},
+                    "result": result_text,
+                    "ok": not _is_tool_error(result_text),
+                }
+            )
+    return trace
 
 
 def _get_llm_from_config(cfg: dict) -> ChatOllama:

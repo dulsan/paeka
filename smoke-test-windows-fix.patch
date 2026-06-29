@@ -1,0 +1,22 @@
+diff --git a/rwp/scripts/smoke-test-bundle.mjs b/rwp/scripts/smoke-test-bundle.mjs
+index e983739..102abdf 100644
+--- a/rwp/scripts/smoke-test-bundle.mjs
++++ b/rwp/scripts/smoke-test-bundle.mjs
+@@ -29,7 +29,7 @@
+ import { JSDOM } from "jsdom";
+ import { readdirSync } from "fs";
+ import path from "path";
+-import { fileURLToPath } from "url";
++import { fileURLToPath, pathToFileURL } from "url";
+ 
+ const rwpRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+ const assetsDir = path.join(rwpRoot, "dist", "assets");
+@@ -68,7 +68,7 @@ global.window.matchMedia = global.matchMedia;
+ let failed = false;
+ 
+ try {
+-  await import(path.join(assetsDir, jsFile));
++  await import(pathToFileURL(path.join(assetsDir, jsFile)).href);
+   // Mounting involves a microtask hop or two (Svelte effects flush
+   // async); give it a moment before inspecting the result.
+   await new Promise((resolve) => setTimeout(resolve, 300));

@@ -1,7 +1,6 @@
 <script lang="ts">
   interface SettingsValues {
     baseURL: string;
-    model: string;
     apiKey: string;
   }
 
@@ -9,20 +8,18 @@
     onSave: (values: SettingsValues) => void;
   }
 
-  let { baseURL, model, apiKey, onSave }: Props = $props();
+  let { baseURL, apiKey, onSave }: Props = $props();
 
   let open = $state(false);
   // One-time snapshot for editing, not a live binding -- see the same
   // note in ChatWindow.svelte. Drafts only flow back via onSave.
   let draftBaseURL = $state(baseURL);
-  let draftModel = $state(model);
   let draftApiKey = $state(apiKey);
 
   function handleSubmit(event: SubmitEvent) {
     event.preventDefault();
     onSave({
       baseURL: draftBaseURL.trim(),
-      model: draftModel.trim(),
       apiKey: draftApiKey.trim(),
     });
     open = false;
@@ -35,10 +32,6 @@
     <label class="settings__field">
       <span>Base URL</span>
       <input type="text" bind:value={draftBaseURL} placeholder="http://localhost:8000/v1" />
-    </label>
-    <label class="settings__field">
-      <span>Model</span>
-      <input type="text" bind:value={draftModel} placeholder="paeka-qwen" />
     </label>
     <label class="settings__field">
       <span>API key (optional)</span>

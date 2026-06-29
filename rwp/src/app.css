@@ -19,6 +19,16 @@
   --color-error: #a8472f;
   --color-error-bg: #f6e8e3;
 
+  /* Code-block syntax colors deliberately reuse the two existing accent
+     inks (keyword/number) plus two new restrained hues (string/comment)
+     from the same warm-paper family, rather than importing an unrelated
+     six-color IDE theme -- see MessageBubble.svelte's :global() rules. */
+  --color-code-bg: #ece7da;
+  --color-code-keyword: var(--color-accent-user);
+  --color-code-number: var(--color-accent-assistant);
+  --color-code-string: #8a5a3b;
+  --color-code-comment: #8a8270;
+
   --font-content: ui-serif, Georgia, "Source Serif Pro", serif;
   --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
@@ -33,6 +43,27 @@
   --radius: 3px;
 }
 
+/* Dark variant of the same "reading room" palette -- same two inks
+   (sage/plum), same warm-paper hue family, just relit for low light.
+   Applied via a data-theme attribute on <html> (see lib/theme.ts) rather
+   than prefers-color-scheme alone, so the in-app toggle in TopNav can
+   override the system default and persist that choice. */
+:root[data-theme="dark"] {
+  --color-paper: #16140f;
+  --color-paper-raised: #1f1c15;
+  --color-ink: #ece6d8;
+  --color-ink-soft: #a39c8a;
+  --color-rule: #3a352a;
+  --color-accent-user: #8fb892;
+  --color-accent-assistant: #b4a0cf;
+  --color-error: #e0795c;
+  --color-error-bg: #3a2018;
+
+  --color-code-bg: #211e16;
+  --color-code-string: #d99a6c;
+  --color-code-comment: #6b6354;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -44,6 +75,7 @@ body {
   background: var(--color-paper);
   color: var(--color-ink);
   font-family: var(--font-ui);
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 #app {

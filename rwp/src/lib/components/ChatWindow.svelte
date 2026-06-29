@@ -17,23 +17,21 @@
   // ("state_referenced_locally") since it's also a common mistake when
   // someone *did* want live reactivity; here it's intentional.
   let baseURL = $state(initialConfig.baseURL ?? "http://localhost:8000/v1");
-  let model = $state(initialConfig.model ?? "paeka-qwen");
   let apiKey = $state(initialConfig.apiKey ?? "");
 
   let chat = $state<Chat | undefined>(undefined);
   let setupError: string | undefined = $state(undefined);
 
   // Recreates the session whenever connection settings change. This is
-  // deliberate -- switching backend/model mid-conversation makes the
-  // existing history's relevance ambiguous, so starting fresh is the
-  // less surprising behaviour. Lives in $effect (not $derived) because
+  // deliberate -- switching backend mid-conversation makes the existing
+  // history's relevance ambiguous, so starting fresh is the less
+  // surprising behaviour. Lives in $effect (not $derived) because
   // constructing a Chat session is a side effect, not a pure computation.
   $effect(() => {
     setupError = undefined;
     try {
       chat = createAgentSession({
         baseURL,
-        model,
         apiKey: apiKey || undefined,
         fetch: initialConfig.fetch,
       });
@@ -47,9 +45,8 @@
     void chat?.sendMessage({ text });
   }
 
-  function handleSaveSettings(values: { baseURL: string; model: string; apiKey: string }) {
+  function handleSaveSettings(values: { baseURL: string; apiKey: string }) {
     baseURL = values.baseURL;
-    model = values.model;
     apiKey = values.apiKey;
   }
 
@@ -59,7 +56,7 @@
 <div class="chat-window">
   <header class="chat-window__header">
     <h1 class="chat-window__title">Research Assistant</h1>
-    <ConnectionSettings {baseURL} {model} {apiKey} onSave={handleSaveSettings} />
+    <ConnectionSettings {baseURL} {apiKey} onSave={handleSaveSettings} />
   </header>
 
   {#if setupError}

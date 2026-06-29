@@ -11,6 +11,7 @@ POST /api/agent/react         — ReAct loop with native function calling (MCP-b
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -54,13 +55,42 @@ class ToolExecuteResponse(BaseModel):
     results: list[dict]
 
 
+class ChatTurnIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ReactRequest(BaseModel):
-    message: str
+    # `message` (single string, no history) is kept only for backward
+    # compatibility with callers that predate multi-turn support
+    # (test-paeka-api.ps1, the README curl example). `messages` (full
+    # history, last entry is the new turn) is the shape the rwp chat UI
+    # actually sends, and is preferred when both are present.
+    message: str | None = None
+    messages: list[ChatTurnIn] | None = None
     max_rounds: int = 10
+
+    def resolve_turn(self) -> tuple[str, list[dict[str, str]]]:
+        """Returns (latest_user_message, prior_history) regardless of which shape the caller used."""
+        if self.messages:
+            history = [m.model_dump() for m in self.messages[:-1]]
+            return self.messages[-1].content, history
+        if self.message is not None:
+            return self.message, []
+        raise ValueError("Either 'message' or 'messages' is required.")
+
+
+class ToolCallTrace(BaseModel):
+    id: str
+    name: str
+    args: dict
+    result: str
+    ok: bool
 
 
 class ReactResponse(BaseModel):
     response: str
+    tool_calls: list[ToolCallTrace] = []
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +210,22 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
     and its latency, and any guardrail trips -- is visible in the trace.
     This is the endpoint to hit to verify the loop end-to-end.
 
-    Example:
+    Example (single-turn, no history):
         curl -X POST http://localhost:8000/api/agent/react \\
              -H "Content-Type: application/json" \\
              -d '{"message": "What tools do you have available?"}'
+
+    Example (multi-turn, preferred -- mirrors /v1/chat/completions' shape):
+        curl -X POST http://localhost:8000/api/agent/react \\
+             -H "Content-Type: application/json" \\
+             -d '{"messages": [{"role": "user", "content": "What tools do you have available?"}]}'
     """
     from backend.agent.react_graph import ReActGraph
+
+    try:
+        user_message, history = body.resolve_turn()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     llm = getattr(request.app.state, "llm", None)
     if llm is None:
@@ -210,13 +250,13 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
         )
 
     graph = ReActGraph(llm=chat_ollama, max_rounds=min(body.max_rounds, 15))
-    response_text = await graph.run(user_message=body.message)
+    result = await graph.run(user_message=user_message, history=history)
 
-    if not response_text:
+    if not result["response"]:
         raise HTTPException(
             status_code=502,
             detail="ReAct loop completed with no final text response. "
                    "Check logs/logfire trace for what happened in each round.",
         )
 
-    return ReactResponse(response=response_text)
+    return ReactResponse(response=result["response"], tool_calls=result["tool_calls"])

@@ -1,46 +1,22 @@
 import { vi } from "vitest";
 
+interface MockReactReply {
+  response: string;
+  tool_calls?: Array<{ id: string; name: string; args: Record<string, unknown>; result: string; ok: boolean }>;
+}
+
 /**
- * Builds a fetch mock that returns a real OpenAI-style SSE stream, so
- * tests exercise the actual parsing path end to end rather than just
- * asserting that functions were called with the right arguments.
+ * Builds a fetch mock returning the actual JSON shape /api/agent/react
+ * responds with, so tests exercise ReactAgentTransport's real parsing
+ * path end to end rather than just asserting functions were called with
+ * the right arguments.
  */
-export function mockSseFetch(deltas: string[]): typeof fetch {
-  const lines: string[] = [];
-  deltas.forEach((delta, i) => {
-    lines.push(
-      `data: ${JSON.stringify({
-        id: "chatcmpl-test",
-        object: "chat.completion.chunk",
-        created: 1700000000,
-        model: "test-model",
-        choices: [
-          {
-            index: 0,
-            delta: i === 0 ? { role: "assistant", content: delta } : { content: delta },
-            finish_reason: null,
-          },
-        ],
-      })}\n\n`,
-    );
-  });
-  lines.push(
-    `data: ${JSON.stringify({
-      id: "chatcmpl-test",
-      object: "chat.completion.chunk",
-      created: 1700000000,
-      model: "test-model",
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-    })}\n\n`,
-  );
-  lines.push("data: [DONE]\n\n");
-
-  const body = lines.join("");
-
+export function mockJsonFetch(reply: string | MockReactReply): typeof fetch {
+  const body: MockReactReply = typeof reply === "string" ? { response: reply, tool_calls: [] } : reply;
   return vi.fn(async () =>
-    new Response(body, {
+    new Response(JSON.stringify(body), {
       status: 200,
-      headers: { "Content-Type": "text/event-stream" },
+      headers: { "Content-Type": "application/json" },
     }),
   ) as unknown as typeof fetch;
 }
