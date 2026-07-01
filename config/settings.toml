@@ -98,6 +98,10 @@ refinement_passes     = ["merge_duplicates", "prune_weak_edges", "validate_types
 # FalkorDB query layer (Cypher multi-hop traversal). Embedded, no Docker,
 # no server process -- SQLite above remains the system of record; this is
 # a derived view synced from it on startup and after extraction/refinement.
+# NOT AVAILABLE ON WINDOWS -- falkordblite's redislite dependency doesn't
+# build on win32. falkor_enabled=true is harmless there: the app detects
+# the missing package at startup and falls back to single-hop SQLite
+# graph queries automatically (no crash, no code change needed).
 falkor_enabled  = true
 falkor_db_path  = "database/falkordb/paeka_kg.db"
 falkor_max_hops = 2

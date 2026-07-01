@@ -77,7 +77,13 @@ dependencies = [
 
     # -- Knowledge graph ---------------------------------------------------
     "networkx>=3.4.0",
-    "falkordblite>=0.10.0",
+    # falkordblite depends on redislite, which does not support win32 --
+    # excluded on Windows via environment marker so `uv sync` doesn't try
+    # (and fail) to build it there. FalkorGraphStore.connect() already
+    # handles the missing-package case gracefully (see backend/knowledge/
+    # falkor_store.py) -- the app falls back to SQLite-only single-hop
+    # graph queries automatically, no code changes needed on Windows.
+    "falkordblite>=0.10.0; sys_platform != 'win32'",
 
     # -- Agentic pipeline --------------------------------------------------
     "langgraph>=0.2.0",
