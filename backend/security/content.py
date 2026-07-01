@@ -10,7 +10,7 @@ Content security layer — applied at three points:
 Threat model:
   - Prompt injection via crafted document content
     ("Ignore previous instructions and…")
-  - Indirect prompt injection via SearXNG web results
+  - Indirect prompt injection via web search results
   - Script/shell injection in LLM output (code blocks containing rm -rf etc.)
   - Data exfiltration attempts embedded in document text
 
@@ -236,7 +236,7 @@ class ContentScanner:
 
     def scan_web_result(self, text: str, url: str = "") -> ScanResult:
         """
-        Scan a SearXNG web result — applies the same injection checks
+        Scan a web search result — applies the same injection checks
         but with context-appropriate logging (lower trust tier).
         """
         result = self.scan_input(text, source=f"web:{url}")

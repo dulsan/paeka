@@ -9,7 +9,6 @@ What is backed up:
   - database/weaviate/                (Weaviate vector data)
   - config/settings.toml              (configuration, NOT .env)
   - backend/skills/definitions/       (custom skill definitions)
-  - infra/searxng/settings.yml        (SearXNG config)
 
 What is NOT backed up:
   - .env                              (contains secrets — back up separately)
@@ -26,7 +25,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import tarfile
 from datetime import datetime, timezone
@@ -39,7 +37,6 @@ _INCLUDE_PATHS = [
     Path("database/weaviate"),
     Path("config/settings.toml"),
     Path("backend/skills/definitions"),
-    Path("infra/searxng/settings.yml"),
 ]
 
 
@@ -88,20 +85,6 @@ def main() -> None:
     if args.list:
         list_backups(args.output)
         return
-
-    # Warn if Weaviate is running (data may be mid-write)
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Status}}", "paeka-weaviate"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.stdout.strip() == "running":
-            print("Warning: paeka-weaviate is running.")
-            print("For a consistent backup, consider stopping it first:")
-            print("  docker compose stop paeka-weaviate")
-            print("Proceeding anyway...\n")
-    except Exception:  # noqa: BLE001
-        pass  # docker not available or container not found
 
     backup(args.output)
 

@@ -11,7 +11,7 @@ ReAct loop: every prompt sent, every raw completion received, every tool
 call and its latency, all visible in one place.
 
 What gets instrumented:
-  - httpx: every outbound HTTP call (Ollama API, MCP client calls, SearXNG)
+  - httpx: every outbound HTTP call (Ollama API, MCP client calls, web search)
     automatically traced with method/URL/status/duration. This is the
     lowest-level net: even calls we didn't explicitly wrap show up.
     Requires the optional 'httpx' extra (opentelemetry-instrumentation-httpx)
@@ -137,7 +137,7 @@ def configure_observability() -> bool:
         "huggingface\\.co,raw\\.githubusercontent\\.com",
     )
 
-    # Lowest-level net: every outbound HTTP call (Ollama, MCP, SearXNG, Qdrant
+    # Lowest-level net: every outbound HTTP call (Ollama, MCP, web search, Qdrant
     # via qdrant-client's httpx transport where applicable).
     # Requires logfire[httpx] (opentelemetry-instrumentation-httpx). If that
     # extra wasn't installed, skip this one integration rather than crashing

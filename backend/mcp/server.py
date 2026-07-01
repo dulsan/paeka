@@ -13,7 +13,7 @@ Tool naming: qdrant_search / qdrant_ingest / qdrant_snapshot
   migration, so the tool names should reflect that from day one.)
 
 Service injection: configure() is called once from app.py's lifespan after
-all services (Qdrant store, embedder, LLM, sandbox) are initialised.
+all services (Qdrant store, embedder, LLM) are initialised.
 """
 
 from __future__ import annotations
@@ -49,9 +49,9 @@ mcp = FastMCP(
         "You are connected to the PAEKA local knowledge assistant. "
         "Use qdrant_search to retrieve information from the local knowledge base. "
         "Use qdrant_ingest to add new information. "
-        "Use web_search when you need current information not in the knowledge base. "
-        "Use execute_code to test code in a hardened, network-isolated sandbox before "
-        "presenting it to the user."
+        "Use graph_search to explore relationships between entities multiple "
+        "hops apart in the knowledge graph (e.g. 'how is X related to Y'). "
+        "Use web_search when you need current information not in the knowledge base."
     ),
 )
 
@@ -59,8 +59,8 @@ mcp = FastMCP(
 _store    = None   # QdrantStore
 _embedder = None   # Embedder
 _llm      = None   # LLMProvider
-_web      = None   # SearXNGClient | None
-_sandbox  = None   # CodeSandbox | None
+_web      = None   # WebSearchClient | None
+_falkor   = None   # FalkorGraphStore | None
 
 
 def configure(
@@ -68,19 +68,19 @@ def configure(
     embedder=None,
     llm=None,
     web_client=None,
-    sandbox=None,
+    falkor=None,
 ) -> None:
     """Inject lifespan-managed services into this module's tool functions."""
-    global _store, _embedder, _llm, _web, _sandbox
+    global _store, _embedder, _llm, _web, _falkor
     _store    = store
     _embedder = embedder
     _llm      = llm
     _web      = web_client
-    _sandbox  = sandbox
+    _falkor   = falkor
     logger.info(
-        "MCP server configured: qdrant=%s embedder=%s llm=%s web=%s sandbox=%s",
+        "MCP server configured: qdrant=%s embedder=%s llm=%s web=%s graph=%s",
         _store is not None, _embedder is not None, _llm is not None,
-        _web is not None, _sandbox is not None,
+        _web is not None, _falkor is not None,
     )
 
 
@@ -126,6 +126,49 @@ async def qdrant_search(query: str, limit: int = 5, collection: str = "chunks") 
     except Exception as exc:
         logger.error("qdrant_search failed: %s", exc)
         return f"Search error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Tool: Knowledge graph multi-hop traversal
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def graph_search(entity: str, max_hops: int = 2) -> str:
+    """
+    Traverse the knowledge graph from a named entity (1..max_hops relations
+    away, either direction) and return the relationship chains found.
+
+    Use this for "how is X related to Y" or "what connects to X" questions
+    -- it finds multi-hop relationships that a single vector search over
+    text chunks would miss. The graph is built from previously ingested
+    documents, so unfamiliar entities simply return no results.
+
+    Args:
+        entity: Entity label to start from (e.g. 'Transformer', 'Qdrant').
+        max_hops: How many relationship hops to traverse (1-4, default 2).
+    """
+    if _falkor is None or not _falkor.available:
+        return "Graph search is not available (knowledge graph or FalkorDB disabled in settings)."
+
+    from backend.tools.schemas import GraphSearchArgs
+    try:
+        args = GraphSearchArgs(entity=entity, max_hops=max_hops)
+    except Exception as exc:
+        return f"Invalid arguments: {exc}"
+
+    try:
+        hops = await _falkor.traverse(label=args.entity, max_hops=args.max_hops)
+        if not hops:
+            return f"No graph relationships found for '{args.entity}'."
+        lines = []
+        for hop in hops:
+            chain = " → ".join(hop.relation_path)
+            desc = f" ({hop.description})" if hop.description else ""
+            lines.append(f"{args.entity} --[{chain}]--> {hop.label}{desc}")
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.error("graph_search failed: %s", exc)
+        return f"Graph search error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +267,8 @@ async def qdrant_snapshot(action: str, collection: str = "chunks") -> str:
 @mcp.tool()
 async def web_search(query: str, num_results: int = 3) -> str:
     """
-    Search the web via the local SearXNG instance for current information.
+    Search the web (DuckDuckGo backend) for current information not
+    available in the local knowledge base.
 
     Args:
         query: Search query string.
@@ -233,7 +277,7 @@ async def web_search(query: str, num_results: int = 3) -> str:
     if _web is None:
         return (
             "Web search is disabled. Set PAEKA_TOOLS__WEB_SEARCH_ENABLED=true "
-            "in .env and ensure SearXNG is running at http://localhost:8888."
+            "in .env to enable it."
         )
     from backend.tools.schemas import WebSearchArgs
     try:
@@ -251,50 +295,6 @@ async def web_search(query: str, num_results: int = 3) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: Execute code in hardened sandbox
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def execute_code(code: str, language: str = "python", timeout: int = 30) -> str:
-    """
-    Execute code in a hardened, network-isolated Docker sandbox.
-
-    The sandbox runs with --network none, --read-only root filesystem,
-    --cap-drop ALL, and resource limits. Always test code here before
-    presenting it to the user.
-
-    Args:
-        code: Source code to execute.
-        language: 'python' or 'bash' (default 'python').
-        timeout: Maximum execution time in seconds (1-120, default 30).
-    """
-    if _sandbox is None:
-        return "Sandbox is not configured."
-
-    from backend.tools.schemas import CodeExecutionArgs
-    try:
-        args = CodeExecutionArgs(code=code, language=language, timeout=timeout)
-    except Exception as exc:
-        return f"Invalid arguments: {exc}"
-
-    try:
-        if not await _sandbox.is_available():
-            return "Docker is not running. Start Docker Desktop and retry."
-        result = await _sandbox.execute(args.code, language=args.language, timeout=args.timeout)
-        output = f"exit_code={result.exit_code}\n--- stdout ---\n{result.stdout}"
-        if result.stderr:
-            output += f"\n--- stderr ---\n{result.stderr}"
-        if result.timed_out:
-            output += "\n[execution timed out]"
-        return output
-    except (NotImplementedError, ValueError, RuntimeError) as exc:
-        return f"Sandbox error: {exc}"
-    except Exception as exc:
-        logger.error("execute_code failed: %s", exc)
-        return f"Unexpected sandbox error: {exc}"
-
-
-# ---------------------------------------------------------------------------
 # Tool: Service health diagnostic
 # ---------------------------------------------------------------------------
 
@@ -302,10 +302,10 @@ async def execute_code(code: str, language: str = "python", timeout: int = 30) -
 async def check_services(target: str = "all") -> str:
     """
     Check the health of PAEKA's internal services: Ollama (:11434),
-    Qdrant (:6333), the PAEKA API itself (:8000), and SearXNG (:8888).
+    Qdrant (:6333), and the PAEKA API itself (:8000).
 
     Args:
-        target: 'all' or a name substring like 'ollama', 'qdrant', 'searxng'.
+        target: 'all' or a name substring like 'ollama', 'qdrant'.
     """
     from backend.tools.diagnostics import check_services as _check
     return await _check(target=target)

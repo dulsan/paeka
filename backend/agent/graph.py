@@ -2,7 +2,7 @@
 backend/agent/graph.py
 =======================
 Agentic RAG pipeline — Planner → Retriever → Critic → Synthesiser.
-Now includes optional SearXNG web client as a fourth retrieval tool.
+Includes an optional web search client as a fourth retrieval tool.
 """
 
 from __future__ import annotations

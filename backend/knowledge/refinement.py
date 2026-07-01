@@ -90,10 +90,15 @@ class GraphRefiner:
         repo: KnowledgeGraphRepository,
         llm: LLMClient,
         settings: KnowledgeGraphSettings,
+        falkor=None,
     ) -> None:
         self._repo = repo
         self._llm = llm
         self._settings = settings
+        # Optional FalkorGraphStore -- refinement passes merge/prune nodes
+        # and edges, so the synced graph needs a fresh resync afterward
+        # too, same reasoning as KnowledgeGraphExtractor.
+        self._falkor = falkor
 
     # ------------------------------------------------------------------
     # Public API
@@ -118,6 +123,10 @@ class GraphRefiner:
             changes = await method()
             results[pass_name] = changes
             logger.info("Pass '%s' complete — %d changes.", pass_name, changes)
+
+        if self._falkor is not None and self._falkor.available:
+            await self._falkor.sync_from_sqlite(self._repo)
+
         return results
 
     # ------------------------------------------------------------------

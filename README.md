@@ -74,13 +74,11 @@ The project is designed for users who want a private, extensible AI assistant ca
 ### Tool Calling
 
 * Web search integration
-* Sandboxed execution
 * Extensible tool architecture
 
 ### Native Windows Support
 
 * PowerShell launch scripts
-* Dockerized infrastructure
 * Local llama.cpp deployment
 
 ---
@@ -303,15 +301,11 @@ paeka/
 │   └── settings.toml
 │
 ├── database/
-│
+
 ├── docs/
-│
-├── infra/
-│   ├── caddy/
-│   └── searxng/
-│
+
 ├── models/
-│
+
 ├── scripts/
 │
 └── tests/
@@ -324,7 +318,6 @@ paeka/
 
 * Python 3.12+ (preferably v3.14.2)
 * UV Package Manager
-* Docker Engine + Compose plugin (no Docker Desktop needed -- see SETUP_DOCKER.md for the one-command containerized setup)
 
 ## Optional
 
@@ -342,36 +335,9 @@ git clone https://github.com/dulsan/paeka.git
 cd paeka
 ```
 
-## 2. Choose a path
+## 2. Install
 
-**Option A: Docker (recommended)** — one command brings up Qdrant, Ollama
-(with GPU passthrough), and the API together, networked and configured to
-talk to each other automatically:
-
-```bash
-docker compose up -d --build
-```
-
-First start takes a while (10-15 minutes is normal) — Ollama has to import
-your GGUF and the API container has to download the embedding/reranker
-models into its cache. Watch progress with:
-
-```bash
-docker compose logs -f paeka-api
-```
-
-Once `docker compose ps` shows `paeka-api` as `healthy`, the app is at
-`http://localhost:8000`. Full setup details (GPU passthrough, rootless
-engine setup, Docker Desktop notes, troubleshooting) are in
-[SETUP_DOCKER.md](SETUP_DOCKER.md) — read it before your first run if
-anything below is unclear, since several of its prerequisites (GPU
-toolkit, freeing up ports already used by a native install) need to be in
-place *before* `docker compose up` for that command to actually be "one
-command."
-
-**Option B: Native** — runs everything directly on the host, no
-containers. More moving parts to manage yourself, but no Docker overhead
-and faster iteration if you're actively developing the backend.
+PAEKA runs natively on the host, no containers.
 
 ```bash
 uv sync --extra dev
@@ -405,9 +371,6 @@ model = "paeka-qwen"
 [retrieval]
 enabled = true
 qdrant_url = "http://localhost:6333"
-
-[sandbox]
-enabled = true  # requires a reachable Docker daemon -- see SETUP_DOCKER.md
 ```
 
 Start PAEKA:
@@ -421,7 +384,7 @@ client), exclude the folder from sync — OneDrive's placeholder/sync layer
 has caused real data-loss and slow-file-access issues with Qdrant's
 storage and the multi-GB GGUF in past runs.
 
-The app is available at `http://localhost:8000` either way. API docs (if
+The app is available at `http://localhost:8000`. API docs (if
 enabled in settings) at `http://localhost:8000/docs`.
 
 ---
@@ -471,11 +434,10 @@ uv run pyright
 
 | File                                  | Purpose                  |
 | ------------------------------------- | ------------------------ |
-| **SETUP_DOCKER.md**                   | Docker setup (GPU, rootless, troubleshooting) |
 | API_REFERENCE.md                      | REST API documentation   |
 | FIXES.md                              | Known issues and fixes   |
 | docs/REVIEW.md                        | Code review findings     |
-| ~~SETUP.md~~                          | **Outdated** -- written for a previous SGLang + Weaviate architecture (tagged v0.7.0; current is v0.11.3+). Use this README + SETUP_DOCKER.md instead until it's rewritten. |
+| ~~SETUP.md~~                          | **Outdated** -- written for a previous SGLang + Weaviate architecture (tagged v0.7.0; current is v0.11.3+). Use this README instead until it's rewritten. |
 
 ---
 
@@ -508,11 +470,11 @@ Use hard-learned lessons to build a defensive local environment.
 - **Second-Round Stabilization Testing:** End-to-end system verification using the wizard to simulate a clean install.
 - **Windows Integration Hardening:** Resolve OneDrive synchronization issues and file lock interactions.
 
-## Phase 4: Dockerization & Advanced Features
+## Phase 4: Advanced Architecture
 
-- **Containerization:** Done -- see [SETUP_DOCKER.md](SETUP_DOCKER.md) for the one-command, rootless, GPU-passthrough `docker compose up` setup (Qdrant + Ollama + API). Self-hosted Langfuse integration still open.
-- **Advanced Architecture:** Hardened code sandboxes, long-context graph compression, CPU-bound router model testing.
-- **Production Hardening:** Structured error handling, graceful degradation, and comprehensive observability.
+- **Agentic Orchestration:** `deepagents` harness on top of LangGraph for planning, sub-agent delegation, and human-in-the-loop approval gates on tool calls.
+- **Agentic Graph RAG:** FalkorDB (via `falkordblite`, embedded, no server) as a Cypher query layer over the existing SQLite knowledge graph.
+- **Production Hardening:** Structured error handling, graceful degradation, and comprehensive observability (structlog).
 
 ---
 

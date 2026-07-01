@@ -1,8 +1,7 @@
 """
 backend/tools/diagnostics.py
 ==============================
-Service health diagnostic tool, updated for the Ollama + Qdrant stack
-(was originally written against llama-server + Weaviate ports).
+Service health diagnostic tool for the Ollama + Qdrant stack.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ def _build_services() -> list[dict]:
     """
     Resolve actual configured hosts/ports rather than assuming everything
     is on localhost -- true for the native dev setup, false as soon as
-    Ollama/Qdrant/SearXNG move into their own containers reachable only by
+    Ollama/Qdrant move into their own containers reachable only by
     service name.
     """
     try:
@@ -39,13 +38,11 @@ def _build_services() -> list[dict]:
         settings = get_settings()
         llm_host, llm_port   = _split(settings.llm.base_url, "localhost", 11434)
         qd_host,  qd_port    = _split(settings.retrieval.qdrant_url, "localhost", 6333)
-        sx_host,  sx_port    = _split(settings.tools.searxng_url, "localhost", 8888)
         api_port             = settings.server.port
     except Exception as exc:  # noqa: BLE001
         logger.warning("diagnostics: falling back to localhost defaults (%s)", exc)
         llm_host, llm_port = "localhost", 11434
         qd_host,  qd_port  = "localhost", 6333
-        sx_host,  sx_port  = "localhost", 8888
         api_port            = 8000
 
     return [
@@ -54,7 +51,6 @@ def _build_services() -> list[dict]:
         # The API checking itself is always self-referential -- localhost
         # is correct here even inside a container.
         {"name": "PAEKA API",            "host": "localhost", "port": api_port, "http_path": "/api/health", "critical": False},
-        {"name": "SearXNG (web search)", "host": sx_host,  "port": sx_port,  "http_path": "/healthz",   "critical": False},
     ]
 
 

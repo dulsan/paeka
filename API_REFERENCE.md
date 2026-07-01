@@ -282,53 +282,6 @@ the model when to apply the skill, not when humans should select it.
 
 ---
 
-## Sandbox
-
-### `GET /api/sandbox/status`
-
-Check whether Docker is available for sandbox execution.
-
-```json
-{ "docker_available": true, "supported_languages": ["python", "bash", "javascript"] }
-```
-
-### `GET /api/sandbox/languages`
-
-List supported execution languages.
-
-### `POST /api/sandbox/execute`
-
-Execute code in an isolated Docker container.
-
-Security: `--network=none`, `--read-only`, `--cap-drop=ALL`, `--memory=256m`, `--pids-limit=64`
-
-**Request**
-```json
-{
-  "code": "print('Hello, PAEKA!')",
-  "language": "python",
-  "timeout": 30
-}
-```
-
-**Response** `200`
-```json
-{
-  "stdout": "Hello, PAEKA!\n",
-  "stderr": "",
-  "exit_code": 0,
-  "timed_out": false,
-  "success": true,
-  "output": "Hello, PAEKA!"
-}
-```
-
-**Errors**
-- `400` — unsupported language or code blocked by content scanner.
-- `503` — Docker not available.
-
----
-
 ## Agent Features
 
 ### `POST /api/agent/iterate`
@@ -393,7 +346,72 @@ Run the self-healing tool calling pipeline.
 }
 ```
 
-Available tool names: `web_search`, `retrieve`, `lint_code`, `format_code`, `typecheck_code`, `execute_code`
+Available tool names: `web_search`, `retrieve`, `graph_search`, `lint_code`, `format_code`, `typecheck_code`
+
+---
+
+### `POST /api/agent/deep`
+
+deepagents orchestrator — planning + HITL + RAG sub-agent. Preferred over `/react` for multi-step tasks.
+
+**Request**
+```json
+{
+  "message": "What recent papers are related to the transformers in my knowledge base?",
+  "conversation_id": "conv-abc123",
+  "thread_id": ""
+}
+```
+
+**Response** `200` (completed)
+```json
+{
+  "answer": "Based on the knowledge base, the following transformers papers...",
+  "thread_id": "a1b2c3d4e5f60001",
+  "interrupted": false,
+  "pending": []
+}
+```
+
+**Response** `200` (interrupted — HITL approval required)
+```json
+{
+  "answer": "",
+  "thread_id": "a1b2c3d4e5f60001",
+  "interrupted": true,
+  "pending": [
+    {
+      "tool": "web_search",
+      "args": {"query": "transformer architecture recent papers 2025"},
+      "description": "Tool execution requires approval\n\nTool: web_search",
+      "allowed_decisions": ["approve", "edit", "reject", "respond"]
+    }
+  ]
+}
+```
+
+When `interrupted` is `true`, send the `thread_id` and your decisions to `/api/agent/deep/resume`.
+
+---
+
+### `POST /api/agent/deep/resume`
+
+Resume an interrupted deep-agent run after HITL approval.
+
+**Request**
+```json
+{
+  "thread_id": "a1b2c3d4e5f60001",
+  "decisions": [{"type": "approve"}]
+}
+```
+
+Decision types:
+- `{"type": "approve"}` — execute the tool as planned
+- `{"type": "reject"}` — skip the tool call
+- `{"type": "edit", "args": {"query": "corrected query"}}` — execute with corrected arguments
+
+**Response** `200` — same shape as `/api/agent/deep`. May interrupt again if a subsequent tool call also requires approval.
 
 ---
 
@@ -463,9 +481,9 @@ Check progress of all download operations (current session only).
 ]
 ```
 
-After download completes, restart the llama.cpp container to load the new model:
+If using the llama.cpp provider, restart it to load the new model:
 ```bash
-docker compose restart paeka-llamacpp
+uv run python main.py
 ```
 
 ---

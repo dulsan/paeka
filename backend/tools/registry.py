@@ -8,12 +8,12 @@ The SelfHealingToolGraph reads tool names and docstrings to build
 the tool schema presented to the LLM.
 
 Registered tools:
-  web_search(query)         — SearXNG search
+  web_search(query)         — Web search
   lint_code(code)           — Ruff lint
   format_code(code)         — Ruff format
   typecheck_code(code)      — Pyright type check
-  execute_code(code, lang)  — Sandboxed Docker execution
   retrieve(query)           — Vector + graph retrieval
+  graph_search(entity)      — Knowledge graph multi-hop traversal (FalkorDB)
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def get_registered_tools(request) -> dict[str, ToolFn]:
     web_client = getattr(request.app.state, "web_client", None)
     if web_client is not None:
         async def web_search(query: str, num_results: int = 3) -> str:
-            """Search the web via SearXNG. Returns top results as text."""
+            """Search the web. Returns top results as text."""
             results = await web_client.search(query, num_results=num_results)
             if not results:
                 return "No results found."
@@ -75,23 +75,6 @@ def get_registered_tools(request) -> dict[str, ToolFn]:
 
     tools["typecheck_code"] = typecheck_code
 
-    # ── Sandboxed code execution ──────────────────────────────────────
-    # [FIX] Was unconditionally calling get_sandbox() regardless of
-    # [sandbox] enabled -- the tool would still work even with the
-    # feature explicitly disabled in settings. Now mirrors the
-    # web_search/retrieve pattern above: only register if app.state
-    # actually has it (set in app.py based on settings.sandbox.enabled).
-    sandbox = getattr(request.app.state, "sandbox", None)
-    if sandbox is not None:
-        async def execute_code(code: str, language: str = "python") -> str:
-            """Execute code in an isolated Docker sandbox. Returns stdout+stderr output."""
-            if not await sandbox.is_available():
-                return "Docker sandbox unavailable."
-            result = await sandbox.execute(code, language=language, timeout=30)
-            return result.output
-
-        tools["execute_code"] = execute_code
-
     # ── RAG retrieval ──────────────────────────────────────────────────
     retrieval = getattr(request.app.state, "retrieval", None)
     if retrieval is not None:
@@ -105,6 +88,20 @@ def get_registered_tools(request) -> dict[str, ToolFn]:
                 for r in results[:5]
             )
         tools["retrieve"] = retrieve
+
+    # ── Knowledge graph multi-hop traversal ──────────────────────────────
+    falkor = getattr(request.app.state, "kg_falkor", None)
+    if falkor is not None and falkor.available:
+        async def graph_search(entity: str, max_hops: int = 2) -> str:
+            """Traverse the knowledge graph from an entity (1-4 hops) to find related entities."""
+            hops = await falkor.traverse(label=entity, max_hops=max_hops)
+            if not hops:
+                return f"No graph relationships found for '{entity}'."
+            return "\n".join(
+                f"{entity} --[{' → '.join(h.relation_path)}]--> {h.label}"
+                for h in hops
+            )
+        tools["graph_search"] = graph_search
 
     logger.debug("Registered tools: %s", list(tools.keys()))
     return tools

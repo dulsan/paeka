@@ -22,7 +22,6 @@ from backend.shared.config import KnowledgeGraphSettings
 
 logger = logging.getLogger(__name__)
 
-_MAX_HOPS = 2
 _MAX_NEIGHBOURS = 10
 
 
@@ -54,6 +53,11 @@ class GraphRetriever:
         self._repo = repo
         self._settings = settings
         self._graph: nx.DiGraph | None = None
+        # Set post-construction by app.py if FalkorDB is available (see
+        # FalkorGraphStore in backend/knowledge/falkor_store.py). When
+        # present, query() uses real Cypher multi-hop traversal instead of
+        # the single-hop-only manual walk below.
+        self.falkor = None
 
     async def load_graph(self) -> None:
         """Load the full graph into memory for fast traversal."""
@@ -75,7 +79,10 @@ class GraphRetriever:
 
         Strategy:
           1. Extract entity mentions from the query text via simple keyword matching.
-          2. For each matched node, walk ``_MAX_HOPS`` hops in the graph.
+          2. For each matched node, traverse its neighbourhood -- real
+             multi-hop Cypher traversal via FalkorDB if self.falkor is set
+             (see backend/knowledge/falkor_store.py), otherwise a
+             single-hop-only SQLite fallback.
           3. Format the subgraph as a compact fact list for LLM injection.
 
         Parameters
@@ -102,28 +109,10 @@ class GraphRetriever:
         if not matched_nodes:
             return GraphContext(entities=[], subgraph="")
 
-        # Walk neighbourhood
-        facts: list[str] = []
-        seen_edges: set[tuple] = set()
-
-        for node in matched_nodes[:5]:  # cap to avoid context explosion
-            outgoing, incoming = await self._repo.get_neighbours(
-                node.id, min_confidence=self._settings.min_edge_confidence
-            )
-
-            for edge in (outgoing + incoming)[:_MAX_NEIGHBOURS]:
-                key = (edge.source_id, edge.target_id, edge.relation_type)
-                if key in seen_edges:
-                    continue
-                seen_edges.add(key)
-
-                src = await self._repo.get_node(edge.source_id)
-                tgt = await self._repo.get_node(edge.target_id)
-                if src and tgt:
-                    desc = f" ({edge.description})" if edge.description else ""
-                    facts.append(
-                        f"• {src.label} --[{edge.relation_type}]--> {tgt.label}{desc}"
-                    )
+        if self.falkor is not None and self.falkor.available:
+            facts = await self._query_via_falkor(matched_nodes[:5])
+        else:
+            facts = await self._query_via_sqlite_neighbours(matched_nodes[:5])
 
         entity_list = [
             {
@@ -147,6 +136,59 @@ class GraphRetriever:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _query_via_falkor(self, matched_nodes: list[KGNode]) -> list[str]:
+        """
+        Real multi-hop traversal (1..falkor_max_hops relations) via
+        FalkorDB Cypher, replacing the single-hop-only manual walk below.
+        """
+        facts: list[str] = []
+        seen: set[tuple] = set()
+
+        for node in matched_nodes:
+            hops = await self.falkor.traverse(
+                label=node.label,
+                max_hops=self._settings.falkor_max_hops,
+                min_confidence=self._settings.min_edge_confidence,
+            )
+            for hop in hops[:_MAX_NEIGHBOURS]:
+                key = (node.label, hop.label, tuple(hop.relation_path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                chain = " → ".join(hop.relation_path)
+                desc = f" ({hop.description})" if hop.description else ""
+                facts.append(
+                    f"• {node.label} --[{chain}]--> {hop.label}{desc}"
+                )
+        return facts
+
+    async def _query_via_sqlite_neighbours(
+        self, matched_nodes: list[KGNode]
+    ) -> list[str]:
+        """Single-hop-only fallback when FalkorDB isn't available."""
+        facts: list[str] = []
+        seen_edges: set[tuple] = set()
+
+        for node in matched_nodes:
+            outgoing, incoming = await self._repo.get_neighbours(
+                node.id, min_confidence=self._settings.min_edge_confidence
+            )
+
+            for edge in (outgoing + incoming)[:_MAX_NEIGHBOURS]:
+                key = (edge.source_id, edge.target_id, edge.relation_type)
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+
+                src = await self._repo.get_node(edge.source_id)
+                tgt = await self._repo.get_node(edge.target_id)
+                if src and tgt:
+                    desc = f" ({edge.description})" if edge.description else ""
+                    facts.append(
+                        f"• {src.label} --[{edge.relation_type}]--> {tgt.label}{desc}"
+                    )
+        return facts
 
     async def _match_entities(self, text: str) -> list[KGNode]:
         """

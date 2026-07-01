@@ -1,19 +1,15 @@
 """
 backend/tools/websearch.py
 ===========================
-Web search client — DuckDuckGo interim implementation.
+Web search client — DuckDuckGo implementation.
 
-Interface is identical to the old SearXNGClient so app.py needs no changes
-other than the import line. When you're ready to add SearXNG back, replace
-this file with a new one that wraps SearXNG and nothing else in the codebase
-needs to change.
+This is the established web search backend per project policy: SearXNG is
+disabled (no local search infra to run/maintain). DuckDuckGo is used via
+their unofficial JSON API (no API key required).
 
-DuckDuckGo is used via their unofficial JSON API (no API key required).
 For production use or higher volume, swap the _search_duckduckgo() backend
-for Brave Search API (free tier: 2000 queries/month with an API key).
-
-The WebResult dataclass and search() / close() signatures are preserved
-from searxng.py exactly.
+for Brave Search API (free tier: 2000 queries/month with an API key) --
+see the commented stub below.
 """
 
 from __future__ import annotations
@@ -39,7 +35,7 @@ _DDG_URL = "https://api.duckduckgo.com/"
 
 @dataclass
 class WebResult:
-    """Single web search result — identical to the SearXNG WebResult."""
+    """Single web search result returned by WebSearchClient."""
     title:      str
     url:        str
     snippet:    str
@@ -50,16 +46,12 @@ class WebResult:
 
 class WebSearchClient:
     """
-    Async web search client.
-
-    Interim implementation uses DuckDuckGo's Instant Answer API.
-    Drop-in replacement for SearXNGClient — same constructor signature,
-    same search() and close() methods.
+    Async web search client backed by DuckDuckGo's Instant Answer API.
 
     Parameters
     ----------
     settings:
-        ToolsSettings — reads web_search_enabled and (future) searxng_url.
+        ToolsSettings — reads web_search_enabled and web_search_max_results.
     scanner:
         ContentScanner instance for filtering web content.
     """
@@ -67,7 +59,7 @@ class WebSearchClient:
     def __init__(self, settings: ToolsSettings, scanner=None) -> None:
         self._enabled = settings.web_search_enabled
         self._scanner = scanner
-        self._max     = getattr(settings, "searxng_max_results", 5)
+        self._max     = getattr(settings, "web_search_max_results", 5)
         self._http    = httpx.AsyncClient(
             headers={"User-Agent": _USER_AGENT},
             follow_redirects=True,
@@ -247,9 +239,3 @@ def _html_to_text(html: str) -> str:
     ):
         html = html.replace(entity, char)
     return re.sub(r"\s+", " ", html).strip()
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compat alias — app.py imports SearXNGClient by name
-# ---------------------------------------------------------------------------
-SearXNGClient = WebSearchClient

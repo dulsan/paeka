@@ -110,7 +110,7 @@ class IngestionSettings(BaseModel):
 
 class KnowledgeGraphSettings(BaseModel):
     enabled: bool = False
-    db_path: str = "database/sqlite/knowledge_graph.db"
+    db_path: str = "database/sqlite/knowledge_graph.db"  # unused -- KG tables live in the shared SQLite db (shared/database.py), kept for back-compat with any existing settings.toml overrides
     extraction_batch_size: int = 5
     refinement_passes: list[str] = Field(default_factory=lambda: [
         "merge_duplicates", "prune_weak_edges", "validate_types"
@@ -126,23 +126,11 @@ class KnowledgeGraphSettings(BaseModel):
         "DEFINED_IN", "RELATED_TO", "AUTHORED_BY", "CITES",
         "CONTRASTS_WITH", "DEPENDS_ON", "PRODUCES",
     ])
-
-
-class SandboxSettings(BaseModel):
-    enabled: bool = True
-    default_timeout: int = 30
-    max_timeout: int = 60
-    memory_limit: str = "256m"
-    cpu_limit: str = "1.0"
-    # [FIX] Set both together when paeka-api runs inside Docker Compose
-    # (sibling containers via the Docker socket) -- see SETUP_DOCKER.md
-    # section 4. scratch_dir is the in-container path where paeka-api
-    # mounted the named volume; scratch_volume is that volume's name,
-    # referenced by name (not path) when mounting into the sandbox
-    # container. Leave both None for native deployments (the default) --
-    # see backend/agent/sandbox.py's module docstring for why.
-    scratch_dir: str | None = None
-    scratch_volume: str | None = None
+    # FalkorDB query layer (Cypher multi-hop traversal) -- SQLite above
+    # stays the system of record; this is a derived, rebuildable view.
+    falkor_enabled: bool = True
+    falkor_db_path: str = "database/falkordb/paeka_kg.db"
+    falkor_max_hops: int = 2
 
 
 class IterationSettings(BaseModel):
@@ -162,10 +150,8 @@ class SkillsSettings(BaseModel):
 
 class ToolsSettings(BaseModel):
     web_search_enabled: bool = False
-    searxng_url: str = "http://localhost:8888"
-    searxng_categories: str = "general"
-    searxng_language: str = "en"
-    searxng_max_results: int = 5
+    web_search_language: str = "en"
+    web_search_max_results: int = 5
 
 
 class SecuritySettings(BaseModel):
@@ -194,7 +180,7 @@ class DeploymentSettings(BaseModel):
 
 class LoggingSettings(BaseModel):
     level: str = "INFO"
-    format: str = "rich"
+    format: str = "console"
 
 
 class Settings(BaseSettings):
@@ -219,7 +205,6 @@ class Settings(BaseSettings):
     tools: ToolsSettings = Field(default_factory=ToolsSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     deploy: DeploymentSettings = Field(default_factory=DeploymentSettings)
-    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     iteration: IterationSettings = Field(default_factory=IterationSettings)
     tool_calling: ToolCallingSettings = Field(default_factory=ToolCallingSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

@@ -22,6 +22,7 @@ from backend.memory.repository import ConversationRepository
 from backend.retrieval.chunker import chunk_text
 from backend.security.content import Severity
 from backend.shared.config import get_settings
+from backend.shared.logging import bind_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -42,6 +43,7 @@ async def chat(
     body: ChatRequest,
     request: Request,
 ) -> StreamingResponse:
+    bind_context(conversation_id=conversation_id)
     settings      = get_settings()
     conv_repo     = ConversationRepository(request.app.state.db)
     llm           = request.app.state.llm

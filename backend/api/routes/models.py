@@ -121,9 +121,8 @@ async def download_model(
     The download runs in the background. Poll /api/models/download/status
     to check progress.
 
-    Note: The llama.cpp container must be restarted after downloading
-    a new model to load it:
-      docker compose restart paeka-llamacpp
+    Note: If using the llama.cpp provider, restart the llama-server
+    process after downloading a new model to load it.
     """
     settings = get_settings()
     dest_dir = Path(settings.models.models_dir) / body.dest_subdir

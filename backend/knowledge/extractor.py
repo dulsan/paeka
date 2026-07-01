@@ -118,10 +118,15 @@ class KnowledgeGraphExtractor:
         repo: KnowledgeGraphRepository,
         llm: LLMClient,
         settings: KnowledgeGraphSettings,
+        falkor=None,
     ) -> None:
         self._repo = repo
         self._llm = llm
         self._settings = settings
+        # Optional FalkorGraphStore -- if set, extraction triggers a full
+        # resync so newly extracted nodes/edges are queryable via Cypher
+        # immediately, not just after the next app restart.
+        self._falkor = falkor
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,6 +166,9 @@ class KnowledgeGraphExtractor:
 
         # Persist everything
         await self._persist(all_entities, all_relations, source_doc)
+
+        if self._falkor is not None and self._falkor.available:
+            await self._falkor.sync_from_sqlite(self._repo)
 
         logger.info(
             "Extraction complete for '%s': %d entities, %d relations",

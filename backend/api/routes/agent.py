@@ -6,6 +6,8 @@ Agentic feature endpoints.
 POST /api/agent/iterate       — autonomous iteration (generate → evaluate → reflect loop)
 POST /api/agent/tools/execute — self-healing tool calling pipeline (legacy, JSON-text parsing)
 POST /api/agent/react         — ReAct loop with native function calling (MCP-backed, Phase 1 litmus test)
+POST /api/agent/deep          — deepagents orchestrator (planning + HITL + RAG sub-agent)
+POST /api/agent/deep/resume   — resume an interrupted deep-agent run after HITL approval
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["agent"])
@@ -202,7 +204,7 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
 
     Uses ChatOllama (langchain-ollama) native function calling against
     Ollama, MCP-discovered tools (qdrant_search, qdrant_ingest, web_search,
-    execute_code, check_services, qdrant_snapshot, list_available_tools),
+    graph_search, check_services, qdrant_snapshot, list_available_tools),
     and the orchestration guardrails (call memoization + circuit breaker).
 
     With Logfire configured (local-only, no account needed), every round
@@ -260,3 +262,129 @@ async def react(body: ReactRequest, request: Request) -> ReactResponse:
         )
 
     return ReactResponse(response=result["response"], tool_calls=result["tool_calls"])
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agent/deep  — deepagents orchestrator
+# ---------------------------------------------------------------------------
+
+class DeepRequest(BaseModel):
+    message: str
+    conversation_id: str = ""
+    thread_id: str = Field(
+        default="",
+        description=(
+            "Leave blank to start a new thread. Supply the thread_id returned "
+            "by a previous interrupted response to continue that conversation."
+        ),
+    )
+
+    class Config:
+        # Import Field here to avoid polluting the module top-level
+        pass
+
+
+class DeepResponse(BaseModel):
+    answer: str
+    thread_id: str
+    interrupted: bool = False
+    pending: list[dict] = Field(default_factory=list)
+
+
+class DeepResumeRequest(BaseModel):
+    thread_id: str
+    decisions: list[dict] = Field(
+        ...,
+        description=(
+            'List of decision objects. Each must have "type": "approve"|"reject"|"edit". '
+            'Edit decisions also need "args" with corrected tool arguments.'
+        ),
+        examples=[[{"type": "approve"}], [{"type": "reject"}]],
+    )
+
+
+@router.post("/agent/deep")
+async def deep_agent(body: DeepRequest, request: Request) -> DeepResponse:
+    """
+    Run the deepagents orchestrator for a single turn.
+
+    The orchestrator plans across three tools (web_search, graph_search,
+    qdrant_ingest -- all requiring human approval) and one sub-agent
+    (rag_researcher, backed by the local RAG pipeline).
+
+    If the orchestrator wants to call a gated tool it will pause and return
+    ``{"interrupted": true, "thread_id": "...", "pending": [...]}``.
+    Send the thread_id and your decision(s) to ``POST /api/agent/deep/resume``
+    to continue.
+    """
+    orchestrator = getattr(request.app.state, "deep_orchestrator", None)
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Deep orchestrator is not available. "
+                "Check that knowledge_graph.enabled and the LLM backend are configured. "
+                "See startup logs for the specific failure."
+            ),
+        )
+
+    from backend.agent.deep_orchestrator import OrchestratorInput
+    inp = OrchestratorInput(
+        query=body.message,
+        conversation_id=body.conversation_id,
+        thread_id=body.thread_id,
+    )
+    out = await orchestrator.run(inp)
+    return DeepResponse(
+        answer=out.answer,
+        thread_id=out.thread_id,
+        interrupted=out.interrupted,
+        pending=out.pending,
+    )
+
+
+@router.post("/agent/deep/resume")
+async def deep_agent_resume(body: DeepResumeRequest, request: Request) -> DeepResponse:
+    """
+    Resume a paused deep-agent run after providing HITL decisions.
+
+    Send one decision object per pending tool call.  Decision types:
+    - ``{"type": "approve"}`` — execute the tool as planned
+    - ``{"type": "reject"}`` — skip the tool call
+    - ``{"type": "edit", "args": {...}}`` — execute with corrected arguments
+
+    The orchestrator may return another interrupt if a subsequent tool call
+    also requires approval -- keep resuming until ``interrupted`` is false.
+    """
+    orchestrator = getattr(request.app.state, "deep_orchestrator", None)
+    if orchestrator is None:
+        raise HTTPException(status_code=503, detail="Deep orchestrator not available.")
+
+    if not body.thread_id:
+        raise HTTPException(
+            status_code=422,
+            detail="thread_id is required for resume. Use the thread_id from the interrupted response.",
+        )
+
+    for i, decision in enumerate(body.decisions):
+        if "type" not in decision:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Decision at index {i} is missing the required 'type' key.",
+            )
+        if decision["type"] not in ("approve", "reject", "edit"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Decision at index {i} has invalid type '{decision['type']}'. "
+                    "Must be 'approve', 'reject', or 'edit'."
+                ),
+            )
+
+    out = await orchestrator.resume(thread_id=body.thread_id, decisions=body.decisions)
+    return DeepResponse(
+        answer=out.answer,
+        thread_id=out.thread_id,
+        interrupted=out.interrupted,
+        pending=out.pending,
+    )

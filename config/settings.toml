@@ -95,6 +95,13 @@ extraction_batch_size = 5
 min_edge_confidence   = 0.6
 refinement_passes     = ["merge_duplicates", "prune_weak_edges", "validate_types"]
 
+# FalkorDB query layer (Cypher multi-hop traversal). Embedded, no Docker,
+# no server process -- SQLite above remains the system of record; this is
+# a derived view synced from it on startup and after extraction/refinement.
+falkor_enabled  = true
+falkor_db_path  = "database/falkordb/paeka_kg.db"
+falkor_max_hops = 2
+
 entity_types = [
     "Concept", "Algorithm", "Method", "Framework",
     "Person", "Organisation", "Dataset", "Paper",
@@ -112,11 +119,9 @@ enabled    = true
 skills_dir = "backend/skills/definitions"
 
 [tools]
-web_search_enabled  = false
-searxng_url         = "http://localhost:8888"
-searxng_categories  = "general"
-searxng_language    = "en"
-searxng_max_results = 5
+web_search_enabled     = false
+web_search_language    = "en"
+web_search_max_results = 5
 
 [security]
 content_scan_enabled = true
@@ -132,14 +137,8 @@ domain = "localhost"
 
 [logging]
 level  = "INFO"
-format = "rich"
+format = "console"
 
-[sandbox]
-enabled         = true
-default_timeout = 30
-max_timeout     = 60
-memory_limit    = "256m"
-cpu_limit       = "1.0"
 
 [iteration]
 default_score_threshold = 0.85

@@ -11,6 +11,12 @@ Responsibilities:
   3. Cache schemas so repeated ReActGraph.run() calls don't re-fetch
      every time; force_refresh=True bypasses the cache (used by the
      list_available_tools self-discovery tool).
+  4. Tool-group scoping -- get_tool_schemas(groups=[...]) and
+     call_tool(..., allowed_tools=...) let a caller restrict itself to a
+     named subset (see backend.tools.schemas.TOOL_GROUPS), so a deepagents
+     sub-agent can be wired to e.g. only "retrieval" tools rather than the
+     full registry. None (the default for both) means unscoped -- every
+     existing caller (ReActGraph) is unaffected by this addition.
 
 Transport: streamable HTTP (requires mcp>=1.1.0). Falls back to SSE for
 mcp==1.0.x automatically.
@@ -142,8 +148,34 @@ async def _get_session(mcp_url: str) -> AsyncIterator[Any]:
 async def get_tool_schemas(
     mcp_url: str = _DEFAULT_MCP_URL,
     force_refresh: bool = False,
+    groups: list[str] | None = None,
 ) -> list[dict]:
-    """Fetch and cache all tool schemas from the MCP server in OpenAI format."""
+    """
+    Fetch and cache all tool schemas from the MCP server in OpenAI format.
+
+    Parameters
+    ----------
+    groups:
+        Optional list of named tool groups (see backend.tools.schemas.
+        TOOL_GROUPS) to scope the returned schemas to. None (default)
+        returns every tool -- the existing, unscoped behaviour every
+        current caller (ReActGraph) relies on. Pass e.g. ["retrieval"]
+        to give a sub-agent only qdrant_search/qdrant_ingest/graph_search.
+    """
+    schemas = await _get_all_tool_schemas(mcp_url=mcp_url, force_refresh=force_refresh)
+    if groups is None:
+        return schemas
+
+    from backend.tools.schemas import tools_in_groups
+    allowed = tools_in_groups(groups)
+    return [s for s in schemas if s["function"]["name"] in allowed]
+
+
+async def _get_all_tool_schemas(
+    mcp_url: str = _DEFAULT_MCP_URL,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Unfiltered tool discovery (the actual fetch + cache logic)."""
     global _schema_cache
     async with _cache_lock:
         if _schema_cache is not None and not force_refresh:
@@ -179,6 +211,7 @@ async def call_tool(
     name: str,
     arguments: dict[str, Any],
     mcp_url: str = _DEFAULT_MCP_URL,
+    allowed_tools: set[str] | None = None,
 ) -> str:
     """
     Call a named MCP tool and return its text output.
@@ -186,7 +219,22 @@ async def call_tool(
     Returns an error string prefixed with "[MCP ERROR]" on failure rather
     than raising, so the calling graph node can surface it to the LLM as
     a tool result instead of crashing the whole run.
+
+    Parameters
+    ----------
+    allowed_tools:
+        Optional set of tool names this caller is permitted to invoke
+        (e.g. backend.tools.schemas.tools_in_groups(["retrieval"]) for a
+        sub-agent scoped to retrieval-only). This is the actual
+        enforcement boundary for sub-agent scoping -- get_tool_schemas()'s
+        groups= filtering only controls what the LLM is told it can call;
+        without this check a sub-agent could still attempt to call a tool
+        name it was never shown. None (default) permits any tool, the
+        existing unscoped behaviour.
     """
+    if allowed_tools is not None and name not in allowed_tools:
+        return f"[MCP ERROR] '{name}' is not in this agent's allowed tool set."
+
     from backend.tools.schemas import validate_tool_args
     try:
         arguments = validate_tool_args(name, arguments)
@@ -211,6 +259,9 @@ async def call_tool(
         return f"[MCP ERROR] {name}: {exc}"
 
 
-async def list_tool_names(mcp_url: str = _DEFAULT_MCP_URL) -> list[str]:
-    schemas = await get_tool_schemas(mcp_url=mcp_url)
+async def list_tool_names(
+    mcp_url: str = _DEFAULT_MCP_URL,
+    groups: list[str] | None = None,
+) -> list[str]:
+    schemas = await get_tool_schemas(mcp_url=mcp_url, groups=groups)
     return [s["function"]["name"] for s in schemas]

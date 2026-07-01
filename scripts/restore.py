@@ -57,8 +57,8 @@ def restore(archive: Path, dry_run: bool = False) -> None:
         tar.extractall(path=Path("."))
         print("\nRestore complete.")
         print(f"Previous data saved to: {dest_backup}/")
-        print("\nRestart the PAEKA stack to apply the restored data:")
-        print("  docker compose restart paeka-api paeka-weaviate")
+        print("\nRestart PAEKA to apply the restored data:")
+        print("  uv run python main.py")
 
 
 def main() -> None:

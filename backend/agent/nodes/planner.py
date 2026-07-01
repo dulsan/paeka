@@ -7,7 +7,7 @@ Tools available:
   "vector"  — semantic similarity search (local knowledge base)
   "graph"   — knowledge graph entity lookup
   "keyword" — BM25-heavy local search (exact terms, identifiers)
-  "web"     — SearXNG live web search (current info, recent events)
+  "web"     — live web search (current info, recent events)
 
 The planner only assigns "web" when the query explicitly requires
 current information or is unlikely to be in the local knowledge base.
@@ -27,7 +27,7 @@ _PLANNER_PROMPT = """\
 You are a research planner for a personal AI assistant with access to:
   - A local knowledge base (vector + keyword search)
   - A knowledge graph of extracted entities and relations
-  - Live web search via SearXNG (use ONLY when current/recent information is needed)
+  - Live web search (use ONLY when current/recent information is needed)
 
 Given the user query below, decompose it into 2-6 focused sub-queries.
 For each sub-query, assign the best retrieval tool:

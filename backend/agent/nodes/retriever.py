@@ -21,7 +21,7 @@ import logging
 from backend.agent.state import AgentState, RetrievalResult, SubQuery
 from backend.knowledge.retriever import GraphRetriever
 from backend.retrieval.engine import RetrievalEngine
-from backend.tools.searxng import SearXNGClient
+from backend.tools.websearch import WebSearchClient
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ async def retriever_node(
     state: AgentState,
     engine: RetrievalEngine,
     graph_retriever: GraphRetriever | None = None,
-    web_client: SearXNGClient | None = None,
+    web_client: WebSearchClient | None = None,
 ) -> AgentState:
     """
     Dispatch all sub-queries from the planner concurrently and merge results.
@@ -77,7 +77,7 @@ async def _dispatch(
     sq: SubQuery,
     engine: RetrievalEngine,
     graph_retriever: GraphRetriever | None,
-    web_client: SearXNGClient | None,
+    web_client: WebSearchClient | None,
 ) -> list[RetrievalResult]:
     tool = sq.get("tool", "vector")
     q    = sq.get("query", "")
@@ -147,7 +147,7 @@ async def _run_graph(
 
 async def _run_web(
     query: str,
-    web_client: SearXNGClient | None,
+    web_client: WebSearchClient | None,
 ) -> list[RetrievalResult]:
     if web_client is None:
         return []

@@ -10,13 +10,13 @@ Startup order:
   2. Model registry
   3. LLM provider (Ollama by default via factory)
   4. Content scanner
-  5. SearXNG web client
+  5. Web search client
   6. Retrieval + Agentic RAG pipeline (Qdrant-backed)
   7. Memory
   8. Knowledge graph
   9. Skills
-  10. Sandbox (Docker code execution, hardened)
-  11. MCP server: inject services, mount at /mcp
+  10. MCP server: inject services, mount at /mcp
+  11. Deep orchestrator (deepagents: planning + HITL + sub-agents)
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from backend.llm.base import LLMProvider
 from backend.security.content import ContentScanner
 from backend.security.auth import AuthMiddleware
 from backend.security.ratelimit import RateLimitMiddleware
+from backend.security.request_context import RequestContextMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -124,13 +125,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 settings.security.content_scan_enabled,
                 settings.security.strict_mode)
 
-    # 5. SearXNG web client
+    # 5. Web search client
     app.state.web_client = None
     if settings.tools.web_search_enabled:
-        from backend.tools.searxng import SearXNGClient
-        web_client = SearXNGClient(settings.tools, scanner=scanner)
+        from backend.tools.websearch import WebSearchClient
+        web_client = WebSearchClient(settings.tools, scanner=scanner)
         app.state.web_client = web_client
-        logger.info("SearXNG web client ready at %s", settings.tools.searxng_url)
+        logger.info("Web search client ready (DuckDuckGo backend).")
     else:
         logger.info("Web search disabled (set PAEKA_TOOLS__WEB_SEARCH_ENABLED=true to enable)")
 
@@ -191,6 +192,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.kg_extractor = None
     app.state.kg_refiner   = None
     app.state.kg_retriever = None
+    app.state.kg_falkor    = None
 
     if settings.knowledge_graph.enabled:
         try:
@@ -198,13 +200,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             from backend.knowledge.extractor import KnowledgeGraphExtractor
             from backend.knowledge.refinement import GraphRefiner
             from backend.knowledge.retriever import GraphRetriever
+            from backend.knowledge.falkor_store import FalkorGraphStore
 
             kg_repo = KnowledgeGraphRepository(db)
             app.state.kg_repo      = kg_repo
-            app.state.kg_extractor = KnowledgeGraphExtractor(kg_repo, llm, settings.knowledge_graph)
-            app.state.kg_refiner   = GraphRefiner(kg_repo, llm, settings.knowledge_graph)
+
+            # FalkorDB query layer (Cypher multi-hop traversal). SQLite via
+            # kg_repo above remains the system of record -- this is a
+            # derived, rebuildable view synced from it on startup and
+            # after every extraction/refinement pass.
+            falkor = None
+            if settings.knowledge_graph.falkor_enabled:
+                falkor = FalkorGraphStore(settings.knowledge_graph.falkor_db_path)
+                if await falkor.connect():
+                    await falkor.sync_from_sqlite(kg_repo)
+                    app.state.kg_falkor = falkor
+                else:
+                    falkor = None
+
+            app.state.kg_extractor = KnowledgeGraphExtractor(kg_repo, llm, settings.knowledge_graph, falkor=falkor)
+            app.state.kg_refiner   = GraphRefiner(kg_repo, llm, settings.knowledge_graph, falkor=falkor)
             kg_ret = GraphRetriever(kg_repo, settings.knowledge_graph)
             await kg_ret.load_graph()
+            kg_ret.falkor = falkor  # opt-in multi-hop path, see retriever.py
             app.state.kg_retriever = kg_ret
 
             if app.state.agent_pipeline is not None:
@@ -224,24 +242,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.skills = mgr
         logger.info("Skills loaded: %d", len(mgr.list_skills()))
 
-    # 10. Sandbox (hardened Docker code execution -- exists already in
-    # backend/agent/sandbox.py but was never instantiated into app.state.
-    # Wired here so the execute_code MCP tool actually has something to call
-    # instead of silently returning "Docker sandbox is not available".
-    app.state.sandbox = None
-    if settings.sandbox.enabled:
-        try:
-            from backend.agent.sandbox import get_sandbox
-            sandbox = get_sandbox()
-            available = await sandbox.is_available()
-            app.state.sandbox = sandbox
-            logger.info("Sandbox ready (docker_available=%s)", available)
-            if not available:
-                logger.warning("Docker not reachable -- execute_code tool will fail until Docker is running.")
-        except Exception as exc:
-            logger.error("Sandbox init failed: %s", exc)
-
-    # 11. MCP server: inject services, mount at /mcp
+    # 10. MCP server: inject services, mount at /mcp
     mcp_server = None
     try:
         from backend.mcp.server import mcp as mcp_server
@@ -251,11 +252,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             embedder=app.state.embedder,
             llm=llm,
             web_client=app.state.web_client,
-            sandbox=app.state.sandbox,
+            falkor=app.state.kg_falkor,
         )
         logger.info("MCP server configured.")
     except Exception as exc:
         logger.error("MCP server configuration failed: %s", exc)
+
+    # 11. Deep orchestrator (deepagents harness: planning + HITL + sub-agents)
+    # Mounted after the MCP server so configure_mcp() has already injected
+    # the services the orchestrator's MCP tool wrappers will call.
+    app.state.deep_orchestrator = None
+    try:
+        from backend.agent.deep_orchestrator import DeepOrchestrator
+        mcp_url = f"http://localhost:{settings.server.port}/mcp"
+        app.state.deep_orchestrator = DeepOrchestrator.create(
+            app_state=app.state,
+            settings=settings,
+            mcp_url=mcp_url,
+        )
+        logger.info("Deep orchestrator ready.")
+    except Exception as exc:
+        logger.error("Deep orchestrator init failed (non-fatal): %s", exc)
 
     # [FIX] Confirmed root cause of "McpError: Session terminated" on every
     # MCP client call, including PAEKA's own self-call from react_graph.py:
@@ -288,6 +305,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await app.state.vector_store.close()
     if app.state.web_client:
         await app.state.web_client.close()
+    if app.state.kg_falkor:
+        await app.state.kg_falkor.close()
     await llm.close()
     await db.close()
 
@@ -323,10 +342,14 @@ def create_app() -> FastAPI:
         upload_rpm=sec.upload_rpm,
         default_rpm=sec.default_rpm,
     )
+    # Added last so it becomes the OUTERMOST middleware (Starlette wraps in
+    # reverse-add order) -- request_id must be bound before auth/rate-limit
+    # run so their own log lines are tagged with it too.
+    app.add_middleware(RequestContextMiddleware)
 
     from backend.api.routes import (
         health, conversations, chat, documents, memory, knowledge,
-        skills, code, export, models, sandbox, agent,
+        skills, code, export, models, agent,
         openai_compat, chat_control,
     )
     app.include_router(health.router,        prefix="/api")
@@ -339,7 +362,6 @@ def create_app() -> FastAPI:
     app.include_router(code.router,          prefix="/api")
     app.include_router(export.router,        prefix="/api")
     app.include_router(models.router,        prefix="/api")
-    app.include_router(sandbox.router,       prefix="/api")
     app.include_router(agent.router,         prefix="/api")
     app.include_router(openai_compat.router, prefix="/v1")
     app.include_router(chat_control.router,  prefix="/api")

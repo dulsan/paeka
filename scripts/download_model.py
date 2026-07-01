@@ -68,7 +68,7 @@ async def _download(repo_id: str, filename: str, dest: str, sha256: str) -> None
     print(
         "\nNext steps:"
         "\n  1. Update PAEKA_LLM__MODEL_PATH in .env"
-        "\n  2. docker compose restart paeka-llamacpp"
+        "\n  2. Restart PAEKA: uv run python main.py"
         "\n  3. curl http://localhost/api/models/active"
     )
 

@@ -35,7 +35,6 @@ data/documents/
 data/images/
 data/uploads/
 data/exports/
-data/sandbox/
 
 # Vector store data - never commit these
 # Weaviate: had RAFT state committed accidentally; untrack with:
@@ -44,6 +43,9 @@ database/weaviate/
 
 # Qdrant
 database/qdrant/
+
+# FalkorDB (embedded graph query layer -- rebuildable from SQLite)
+database/falkordb/
 
 # Logs
 *.log
